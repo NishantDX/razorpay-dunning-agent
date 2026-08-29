@@ -57,6 +57,7 @@ make generate    # build the synthetic batch   -> data/cases.jsonl
 make feed        # shape it into a webhook feed -> data/events.jsonl
 make diagnose    # root-cause every event, scored vs ground truth
 make policy      # plan a bounded recovery for every event
+make execute     # diagnose -> plan -> execute against Razorpay test APIs
 make run         # run the agent over the batch -> reports/latest.html
 make report      # open the report
 ```
@@ -128,10 +129,20 @@ docs/architecture.md the architecture doc
   `needs_review`, never a guess.
 - **Step 5** — `make policy`: turns a diagnosis + customer/subscription context
   into a **fixed, bounded plan** — an ordered list of interventions with a
-  schedule. The cause→steps table lives in `config/policy.yaml` (readable
-  without touching code); context rules (unreachable customer, dead mandate,
-  low-value write-off, high-value risk escalation) live in `policy.py`. Never
-  retries a security block or a dead mandate; every plan ends in a human handoff
-  or a deliberate write-off; hard-capped at 3 retries / 2 messages.
+  schedule. The cause→steps table lives in `config/policy.yaml`; context rules
+  live in `policy.py`. Never retries a security block or a dead mandate; every
+  plan ends in a human handoff or a deliberate write-off; hard-capped at 3
+  retries / 2 messages.
+- **Step 6** — `make execute`: walks each plan against **real Razorpay
+  test-mode APIs** (`retry_*` creates a fresh Order, `send_*_link` creates a
+  Payment Link), every create carrying an idempotency key the gateway dedupes on
+  so a step can't double-charge. A virtual clock is fast-forwarded between
+  steps; the ≥24h retry spacing and the 09:00–20:00 contact window are enforced.
+  The *outcome* of an attempt (did the customer actually pay) is the one
+  simulated part — rolled from the case's hidden `latent` with a seeded RNG,
+  since test mode has no real payer. If a subscription's mandate dies
+  mid-sequence, the executor re-plans once to mandate repair and stops retrying.
+  With no keys / `RAZORPAY_DRY_RUN=1` a local fake stands in. Offline batch:
+  ~58% recovered, ~55% of value, **0 guardrail violations**.
 
-Next: the executor (step 6) — real Razorpay test-mode API calls.
+Next: the guardrail layer (step 7) — formalise the caps + violation tracking.

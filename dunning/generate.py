@@ -90,7 +90,7 @@ MESSY_REASON_RATE = 0.15
 
 # fraction of recoverable-looking subscription cases where the mandate is
 # revoked partway through the sequence (step 12's deliberate failure).
-MANDATE_REVOKE_RATE = 0.16
+MANDATE_REVOKE_RATE = 0.20
 
 LANGUAGE_WEIGHTS = {"en": 0.45, "hinglish": 0.40, "hi": 0.15}
 REACHABLE_RATE = 0.85
@@ -471,7 +471,8 @@ def _build_latent(rng: random.Random, root_cause: str, kind: str) -> dict:
         latent["base_recovery_prob"] = 0.0  # nothing to retry
         latent["link_response_prob"] = 0.35 if rng.random() > 0.25 else 0.10
 
-    # a mandate that dies partway through an otherwise-recoverable subscription
+    # a mandate that dies partway through an otherwise-recoverable subscription:
+    # the executor sees it on the Nth action and must re-plan / stop.
     if (
         kind == "subscription"
         and root_cause in ("insufficient_funds", "bank_timeout", "do_not_honour",
@@ -479,7 +480,7 @@ def _build_latent(rng: random.Random, root_cause: str, kind: str) -> dict:
         and not latent["chronic"]
         and rng.random() < MANDATE_REVOKE_RATE
     ):
-        latent["mandate_revokes_at_attempt"] = rng.choice([2, 2, 3])
+        latent["mandate_revokes_at_attempt"] = rng.choice([1, 2, 2])
 
     return latent
 

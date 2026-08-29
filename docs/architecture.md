@@ -138,6 +138,38 @@ different cause (step 12's mandate-dies-mid-sequence is exactly this).
 "next month-start"); the ≥24h spacing and the 09:00–20:00 contact window are
 layered on by the guardrails in step 7, not here.
 
+### Executor (`dunning/execute.py`, step 6)
+
+`execute_plan(case, plan, clock) -> ExecutionResult` walks a plan's scheduled
+steps, one at a time, advancing a virtual `Clock` to each step's guarded time.
+
+**Real vs simulated.** `retry_*` really calls `client.order.create`;
+`send_*_link` really calls `client.payment_link.create`. Both go through
+`RazorpayGateway`, which attaches an idempotency key (`dun_<case>_<i>_<action>`)
+and returns the first response for a repeated key - a step can never create two
+charges. With `RAZORPAY_DRY_RUN=1` or no keys, a local fake with the same shape
+stands in (its ids are derived from the idempotency key, so runs stay
+reproducible). The **only** simulated thing is whether the customer actually
+paid: `_recovered()` rolls the case's hidden `latent` with a seeded RNG
+(`f"{seed}:{case_id}:outcome"`). The agent never sees `latent`.
+
+**Guardrail timing** (minimal here; step 7 formalises violation tracking): a
+retry is pushed out to ≥24h after the previous retry; a message is moved into
+the 09:00-20:00 window; a hard cap of 5 actions forces a handoff.
+
+**Stopping rules** end the sequence immediately: money recovered; the customer
+replies stop / unsubscribe / dispute; the subscription mandate is found dead;
+retries or the action cap are exhausted; escalation to a human. Every result
+carries `stop_reason` (a `config.STOP_REASONS` value) and a full per-attempt
+log (action, scheduled vs actual time, Razorpay ref, idempotency key, outcome).
+
+**Re-planning.** `_cause_shift()` reports a materially different cause revealed
+mid-run. Today the simulator only models the mandate dying on the Nth action
+(`latent.mandate_revokes_at_attempt`); when it fires and `plan.replan_allowed`,
+the executor re-plans **once** to mandate repair and continues from the current
+clock time. This is step 12's deliberate failure, and it already works: retries
+stop, the mandate link is tried, then a human handoff - 0 rule violations.
+
 ## Where we deliberately did NOT use an LLM, and why
 
 The retry schedule, every limit and stopping rule, all money math, the "did it

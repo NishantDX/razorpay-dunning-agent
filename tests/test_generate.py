@@ -117,7 +117,7 @@ def test_mandate_revokes_midway_subset():
     for c in revoke:
         assert c["kind"] == "subscription"
         assert c["root_cause"] in retry_safe
-        assert c["latent"]["mandate_revokes_at_attempt"] in (2, 3)
+        assert c["latent"]["mandate_revokes_at_attempt"] in (1, 2)
         assert c["latent"]["chronic"] is False
 
 
