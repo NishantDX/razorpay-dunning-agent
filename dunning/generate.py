@@ -1,0 +1,434 @@
+"""Step 2 - synthetic at-risk case generator.
+
+Produces ``data/cases.jsonl``: ~300 "revenue is slipping away" cases, each one
+either a failed one-time payment or a failed subscription charge. Every case
+carries four things:
+
+* what the diagnoser will see   -> ``raw_failure_reason`` (~15% is messy free text)
+* ground truth for scoring      -> ``root_cause``
+* a customer profile            -> ``customer`` (reachable?, history, language)
+* hidden probabilistic params   -> ``latent``: the executor (step 6) rolls a
+  *seeded* RNG against these at each attempt to decide whether money actually
+  arrives. This is what bakes in the patterns a disciplined agent exploits and
+  a naive one misses:
+    - insufficient_funds recovers far more often when retried near the
+      customer's salary day (``funds_return_day``)
+    - an expired card never clears on retry - you must switch method / send a link
+    - a bank timeout is usually transient - one quick retry often works
+    - a cancelled mandate must never be auto-retried - link + human only
+    - an abandoned checkout has nothing to retry - a payment link is the only move
+
+Reproducibility: everything derives from the seed. Each case gets its own RNG
+seeded by ``sha256(seed : case_id)``, so a case's data and hidden outcome do not
+depend on how many cases were generated before it or in what order.
+
+Run:  python -m dunning.generate  [--count N] [--seed S] [--out PATH]
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import random
+import string
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from faker import Faker
+
+from dunning import config
+
+GENERATOR_VERSION = 2
+
+# --------------------------------------------------------------------------- #
+# Generation knobs - the tunable mix. The *actual* resulting split is printed
+# after every run and written to data/cases.meta.json, so these stay honest.
+# --------------------------------------------------------------------------- #
+
+# one-time payments vs subscription charges
+KIND_WEIGHTS = {"payment": 0.65, "subscription": 0.35}
+
+# root cause, conditional on kind. Keys are a subset of config.ROOT_CAUSES
+# (minus "unknown", which only the diagnoser may assign).
+ROOT_CAUSE_WEIGHTS = {
+    "payment": {
+        "insufficient_funds": 0.40,
+        "bank_timeout": 0.25,
+        "expired_card": 0.22,
+        "abandoned": 0.13,
+    },
+    "subscription": {
+        "insufficient_funds": 0.40,
+        "mandate_cancelled": 0.28,
+        "bank_timeout": 0.20,
+        "expired_card": 0.12,
+    },
+}
+
+# fraction of cases whose raw_failure_reason is messy free text rather than a
+# clean bank / gateway description (exercises the diagnoser's LLM fallback).
+MESSY_REASON_RATE = 0.15
+
+# fraction of recoverable-looking subscription cases where the mandate is
+# revoked partway through the sequence (step 12's deliberate failure).
+MANDATE_REVOKE_RATE = 0.16
+
+LANGUAGE_WEIGHTS = {"en": 0.45, "hinglish": 0.40, "hi": 0.15}
+REACHABLE_RATE = 0.85
+
+# amount range in whole rupees, by kind (subscriptions skew smaller / recurring)
+AMOUNT_RANGE = {"payment": (99, 50000), "subscription": (149, 4999)}
+
+# failures are spread across this many days before the reference "now"
+FAILURE_WINDOW_DAYS = 30
+
+IST = timezone(timedelta(hours=5, minutes=30))
+# Fixed reference point so failed_at timestamps are reproducible run to run.
+REFERENCE_NOW = datetime(2026, 8, 29, 10, 0, tzinfo=IST)
+
+# hour-of-day weights for when the original payment failed (daytime-heavy)
+_HOUR_WEIGHTS = [1, 1, 1, 1, 1, 2, 3, 5, 7, 9, 10, 10, 9, 9, 9, 9, 10, 11, 11, 10, 8, 6, 4, 2]
+
+# --------------------------------------------------------------------------- #
+# Failure-reason text pools
+# --------------------------------------------------------------------------- #
+
+_CLEAN_REASONS = {
+    "insufficient_funds": [
+        "Your payment failed. Reason: insufficient funds in the account.",
+        "Payment declined by bank - insufficient balance.",
+        "Transaction failed: account balance too low to complete the payment.",
+    ],
+    "expired_card": [
+        "Your card has expired. Please try again with a different card.",
+        "Payment failed because the card has expired.",
+        "The card used has expired; please use another payment method.",
+    ],
+    "bank_timeout": [
+        "The bank did not respond in time. Please retry the payment.",
+        "Payment failed due to a timeout at the bank's end. No amount was deducted.",
+        "Gateway timeout while authorising the payment.",
+    ],
+    "mandate_cancelled": [
+        "The e-mandate for this subscription has been cancelled by the customer.",
+        "Recurring charge failed: autopay mandate revoked at the bank.",
+        "The autopay mandate is no longer active for this subscription.",
+    ],
+    "abandoned": [
+        "Customer did not complete the payment.",
+        "Checkout was started but no payment was attempted.",
+        "Order was created; the customer left before paying.",
+    ],
+}
+
+_MESSY_REASONS = {
+    "insufficient_funds": [
+        "txn declnd - insuff bal, cust says salary comes on 1st",
+        "ERR 51 do not honour / low funds",
+        "NACH return - reason code: 'insufficient funds'",
+    ],
+    "expired_card": [
+        "card 4xxxxx exp 06/25 -> reattempt w new instrument",
+        "resp code 54 expired card, pls ask cust to update",
+        "vault card dead, tokenisation failed, exp date in past",
+    ],
+    "bank_timeout": [
+        "UPI timeout @ NPCI, RRN not generated, maybe retry",
+        "no response frm issuer after 30s, socket closed",
+        "PG error: upstream timed out (504) mid-auth",
+    ],
+    "mandate_cancelled": [
+        "auto-debit bounced, e-mandate not active anymore",
+        "token rejected by bank - customer cancelled autopay",
+        "sub charge fail: mandate status = REVOKED",
+    ],
+    "abandoned": [
+        "cust called - says they never reached the payment page",
+        "order stuck in 'created', 0 payment attempts logged",
+        "link opened, no txn - customer dropped at the OTP screen",
+    ],
+}
+
+_ID_ALPHABET = string.ascii_letters + string.digits
+
+
+# --------------------------------------------------------------------------- #
+# Per-case helpers (all draws come from the case-local RNG)
+# --------------------------------------------------------------------------- #
+
+def _case_rng(seed: int, case_id: str) -> random.Random:
+    """A random.Random seeded so a case's data + hidden outcome depend only on
+    (seed, case_id) - never on generation order or batch size."""
+    digest = hashlib.sha256(f"{seed}:{case_id}".encode()).hexdigest()
+    return random.Random(int(digest[:16], 16))
+
+
+def _weighted(rng: random.Random, mapping: dict) -> str:
+    keys = list(mapping)
+    return rng.choices(keys, weights=[mapping[k] for k in keys])[0]
+
+
+def _rand_id(rng: random.Random, prefix: str, n: int = 14) -> str:
+    return prefix + "".join(rng.choice(_ID_ALPHABET) for _ in range(n))
+
+
+def _amount_rupees(rng: random.Random, kind: str) -> int:
+    lo, hi = AMOUNT_RANGE[kind]
+    amt = math.exp(rng.uniform(math.log(lo), math.log(hi)))  # log-uniform: skewed low
+    if amt < 500:
+        step = 1
+    elif amt < 2000:
+        step = 10
+    elif amt < 10000:
+        step = 50
+    else:
+        step = 100
+    amt = int(round(amt / step) * step)
+    return max(lo, min(hi, amt))
+
+
+def _failed_at(rng: random.Random, reference_now: datetime) -> datetime:
+    days = rng.randint(1, FAILURE_WINDOW_DAYS)
+    hour = rng.choices(range(24), weights=_HOUR_WEIGHTS)[0]
+    minute = rng.randint(0, 59)
+    dt = reference_now - timedelta(days=days)
+    return dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _raw_reason(rng: random.Random, root_cause: str) -> tuple:
+    if rng.random() < MESSY_REASON_RATE:
+        return rng.choice(_MESSY_REASONS[root_cause]), True
+    return rng.choice(_CLEAN_REASONS[root_cause]), False
+
+
+def _build_customer(rng: random.Random, faker: Faker, kind: str) -> dict:
+    if kind == "subscription":
+        prior_payments = rng.randint(1, 24)  # they had a running subscription
+    else:
+        prior_payments = rng.choices(
+            [0, 1, 2, 3, 5, 8, 12], weights=[3, 4, 4, 3, 2, 2, 1]
+        )[0]
+    return {
+        "customer_id": _rand_id(rng, "cust_"),
+        "name": faker.name(),
+        "email": faker.safe_email(),
+        "contact": "+91" + str(rng.randint(6, 9))
+        + "".join(str(rng.randint(0, 9)) for _ in range(9)),
+        "language": _weighted(rng, LANGUAGE_WEIGHTS),
+        "reachable": rng.random() < REACHABLE_RATE,
+        "prior_payments": prior_payments,
+        "prior_success_rate": round(rng.uniform(0.55, 0.98), 2),
+    }
+
+
+def _build_subscription(rng: random.Random, root_cause: str, amount_paise: int) -> dict:
+    return {
+        "subscription_id": _rand_id(rng, "sub_"),
+        "plan_id": _rand_id(rng, "plan_", 12),
+        "invoice_id": _rand_id(rng, "inv_"),
+        "recurring_amount_paise": amount_paise,
+        "billing_cycle": rng.choice(["monthly", "monthly", "monthly", "weekly", "yearly"]),
+        "charge_attempt": rng.randint(2, 18),  # not their first charge
+        "mandate_status": "cancelled" if root_cause == "mandate_cancelled" else "active",
+    }
+
+
+def _build_latent(rng: random.Random, root_cause: str, kind: str) -> dict:
+    """Hidden parameters the executor rolls against. All probabilities are for a
+    single, well-targeted attempt; the executor combines them with timing and
+    reachability at run time."""
+    latent = {
+        "base_recovery_prob": 0.0,        # a spaced retry, no timing bonus
+        "funds_return_day": None,         # day-of-month money reliably lands (salary)
+        "timing_bonus_prob": 0.0,         # added when retried within ~1 day of that
+        "transient_retry_prob": 0.0,      # an immediate retry_now clears it (bank blip)
+        "method_dead": False,             # retrying the same instrument can never work
+        "link_response_prob": 0.0,        # customer pays if sent a payment link
+        "mandate_link_prob": 0.0,         # customer re-authorises if sent a mandate link
+        "opt_out_prob": 0.02,             # customer replies stop / unsubscribe on a msg
+        "chronic": False,                 # unrecoverable no matter what the agent does
+        "mandate_revokes_at_attempt": None,  # mandate dies mid-sequence at this attempt
+    }
+
+    if root_cause == "insufficient_funds":
+        latent["funds_return_day"] = rng.choice([1, 1, 2, 3, 5, 28, 30])
+        latent["base_recovery_prob"] = 0.12
+        latent["timing_bonus_prob"] = 0.78
+        latent["link_response_prob"] = 0.30
+        if rng.random() < 0.15:
+            latent["chronic"] = True
+            latent["timing_bonus_prob"] = 0.10
+            latent["link_response_prob"] = 0.08
+
+    elif root_cause == "expired_card":
+        latent["method_dead"] = True
+        latent["base_recovery_prob"] = 0.02
+        latent["link_response_prob"] = 0.55 if rng.random() > 0.20 else 0.10
+
+    elif root_cause == "bank_timeout":
+        latent["transient_retry_prob"] = 0.70 if rng.random() > 0.20 else 0.15
+        latent["base_recovery_prob"] = 0.72
+        latent["link_response_prob"] = 0.40
+        if rng.random() < 0.10:
+            latent["chronic"] = True
+            latent["base_recovery_prob"] = 0.05
+            latent["transient_retry_prob"] = 0.05
+
+    elif root_cause == "mandate_cancelled":
+        latent["method_dead"] = True  # auto-retry here is also a policy breach
+        latent["base_recovery_prob"] = 0.0
+        latent["mandate_link_prob"] = 0.40 if rng.random() > 0.25 else 0.08
+
+    elif root_cause == "abandoned":
+        latent["base_recovery_prob"] = 0.0  # nothing to retry
+        latent["link_response_prob"] = 0.35 if rng.random() > 0.25 else 0.10
+
+    # a mandate that dies partway through an otherwise-recoverable subscription
+    if (
+        kind == "subscription"
+        and root_cause in ("insufficient_funds", "bank_timeout")
+        and not latent["chronic"]
+        and rng.random() < MANDATE_REVOKE_RATE
+    ):
+        latent["mandate_revokes_at_attempt"] = rng.choice([2, 2, 3])
+
+    return latent
+
+
+# --------------------------------------------------------------------------- #
+# Case + batch assembly
+# --------------------------------------------------------------------------- #
+
+def _build_case(index: int, seed: int, reference_now: datetime) -> dict:
+    case_id = f"case_{index:04d}"
+    rng = _case_rng(seed, case_id)
+    faker = Faker()
+    faker.seed_instance(int(hashlib.sha256(case_id.encode()).hexdigest()[:12], 16))
+
+    kind = _weighted(rng, KIND_WEIGHTS)
+    root_cause = _weighted(rng, ROOT_CAUSE_WEIGHTS[kind])
+
+    amount_rupees = _amount_rupees(rng, kind)
+    amount_paise = amount_rupees * 100
+    failed_at = _failed_at(rng, reference_now)
+    reason, reason_is_messy = _raw_reason(rng, root_cause)
+    customer = _build_customer(rng, faker, kind)
+    latent = _build_latent(rng, root_cause, kind)
+
+    is_sub = kind == "subscription"
+    return {
+        "schema_version": 1,
+        "case_id": case_id,
+        "kind": kind,
+        "source": "synthetic",
+        "amount_paise": amount_paise,
+        "amount_rupees": amount_rupees,
+        "currency": "INR",
+        "failed_at": failed_at.isoformat(),
+        "root_cause": root_cause,          # ground truth; the diagnoser must recover this
+        "raw_failure_reason": reason,
+        "reason_is_messy": reason_is_messy,
+        "customer": customer,
+        "order_id": None if is_sub else _rand_id(rng, "order_"),
+        # abandoned checkouts never produced a payment object
+        "payment_id": (
+            None if (is_sub or root_cause == "abandoned") else _rand_id(rng, "pay_")
+        ),
+        "subscription": (
+            _build_subscription(rng, root_cause, amount_paise) if is_sub else None
+        ),
+        "latent": latent,
+    }
+
+
+def generate_cases(count: int, seed: int = None, reference_now: datetime = REFERENCE_NOW):
+    """Return a list of ``count`` case dicts. Deterministic in (count is only the
+    range; each case depends on ``seed`` and its own id)."""
+    if seed is None:
+        seed = config.RANDOM_SEED
+    return [_build_case(i, seed, reference_now) for i in range(count)]
+
+
+def write_cases(cases, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for case in cases:
+            fh.write(json.dumps(case, ensure_ascii=False) + "\n")
+
+
+def _distribution(cases) -> dict:
+    by_kind = Counter(c["kind"] for c in cases)
+    by_cause = Counter(c["root_cause"] for c in cases)
+    by_language = Counter(c["customer"]["language"] for c in cases)
+    return {
+        "by_kind": dict(by_kind),
+        "by_root_cause": dict(by_cause),
+        "by_language": dict(by_language),
+        "messy_reasons": sum(c["reason_is_messy"] for c in cases),
+        "unreachable_customers": sum(not c["customer"]["reachable"] for c in cases),
+        "chronic_unrecoverable": sum(c["latent"]["chronic"] for c in cases),
+        "mandate_revokes_midway": sum(
+            c["latent"]["mandate_revokes_at_attempt"] is not None for c in cases
+        ),
+        "total_at_risk_rupees": sum(c["amount_rupees"] for c in cases),
+    }
+
+
+def _write_meta(cases, out_path: Path, seed: int, reference_now: datetime) -> Path:
+    meta = {
+        "generator_version": GENERATOR_VERSION,
+        "generated_at": datetime.now(IST).isoformat(),
+        "seed": seed,
+        "count": len(cases),
+        "reference_now": reference_now.isoformat(),
+        "cases_file": str(out_path),
+        "distribution": _distribution(cases),
+    }
+    meta_path = Path(out_path).with_name("cases.meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta_path
+
+
+def _print_summary(cases, out_path: Path, meta_path: Path) -> None:
+    dist = _distribution(cases)
+    print(f"\nGenerated {len(cases)} cases -> {out_path}")
+    print(f"metadata               -> {meta_path}")
+    print("\n  by kind:")
+    for k, v in sorted(dist["by_kind"].items()):
+        print(f"    {k:<14} {v:>4}  ({v / len(cases):.0%})")
+    print("  by root cause:")
+    for k, v in sorted(dist["by_root_cause"].items(), key=lambda kv: -kv[1]):
+        print(f"    {k:<20} {v:>4}  ({v / len(cases):.0%})")
+    print("  by language:")
+    for k, v in sorted(dist["by_language"].items(), key=lambda kv: -kv[1]):
+        print(f"    {k:<14} {v:>4}  ({v / len(cases):.0%})")
+    print(
+        "\n  messy free-text reasons : {messy_reasons}"
+        "\n  unreachable customers   : {unreachable_customers}"
+        "\n  chronic (unrecoverable) : {chronic_unrecoverable}"
+        "\n  mandate dies mid-seq    : {mandate_revokes_midway}"
+        "\n  total at-risk value     : Rs {total_at_risk_rupees:,}".format(**dist)
+    )
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="Generate the synthetic at-risk batch.")
+    parser.add_argument("--count", type=int, default=config.BATCH_SIZE,
+                        help=f"number of cases (default {config.BATCH_SIZE})")
+    parser.add_argument("--seed", type=int, default=config.RANDOM_SEED,
+                        help=f"RNG seed (default {config.RANDOM_SEED})")
+    parser.add_argument("--out", type=Path, default=config.CASES_FILE,
+                        help=f"output JSONL path (default {config.CASES_FILE})")
+    args = parser.parse_args(argv)
+
+    cases = generate_cases(args.count, seed=args.seed)
+    write_cases(cases, args.out)
+    meta_path = _write_meta(cases, args.out, args.seed, REFERENCE_NOW)
+    _print_summary(cases, args.out, meta_path)
+
+
+if __name__ == "__main__":
+    main()

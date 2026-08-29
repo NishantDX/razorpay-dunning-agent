@@ -100,4 +100,9 @@ docs/architecture.md the architecture doc
 
 ## Status
 
-**Step 1 of 13 complete:** repo skeleton. Next: the synthetic data generator.
+**Step 2 of 13 complete:** synthetic data generator (`dunning/generate.py`).
+`make generate` writes ~300 seeded at-risk cases to `data/cases.jsonl` plus a
+`data/cases.meta.json` summary. Each case carries ground-truth `root_cause`, a
+customer profile, a raw failure reason (~15% deliberately messy), and hidden
+`latent` parameters the executor will roll a seeded RNG against to decide whether
+money actually arrives. Next: the event feed (step 3).

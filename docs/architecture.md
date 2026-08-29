@@ -18,6 +18,30 @@
 _TODO: diagram + one line per component (generator, feed, diagnoser, policy engine,
 executor, guardrails, message writer, audit log, batch runner)._
 
+### Synthetic data (`dunning/generate.py`, step 2)
+
+There is no real customer paying in Razorpay test mode, so each generated case
+hides a `latent` block: probabilities and one salary day that the **executor**
+(step 6) rolls a *seeded* RNG against at each attempt to decide whether the money
+actually arrives. Outcomes are therefore probabilistic and emergent but fully
+reproducible - the same seed always yields the same batch and the same recoveries.
+Per-case RNG is seeded by `sha256(seed : case_id)`, so a case is independent of
+batch size and generation order.
+
+Baked-in patterns a disciplined agent can exploit (and a naive one misses):
+`insufficient_funds` recovers far more often when retried within ~1 day of
+`funds_return_day`; `expired_card` never clears on retry (needs switch-method /
+payment link); `bank_timeout` is usually transient (one quick retry often works);
+`mandate_cancelled` must never be auto-retried; `abandoned` has nothing to retry.
+A `chronic` slice is unrecoverable by design so "% recovered" stays honest, and a
+small subset of subscriptions has `mandate_revokes_at_attempt` set - the mandate
+dies mid-sequence (step 12's deliberate failure).
+
+Time is a **virtual clock**: the batch runner keeps a simulated "now" it
+fast-forwards between attempts, so the >=24h-gap rule, the 09:00-20:00 contact
+window, and the salary-day timing pattern genuinely function without waiting in
+real time.
+
 ## Where we deliberately did NOT use an LLM, and why
 
 _TODO. Short version: the retry schedule, every limit and stopping rule, all money math,
