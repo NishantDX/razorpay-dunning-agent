@@ -1,0 +1,27 @@
+# Root cause -> intervention plan. Consumed by dunning/policy.py (step 5).
+# This file is deterministic policy: plain data, fully auditable, no code.
+# TODO (step 5): fill in the real decision table, schedules, and customer-context rules.
+
+insufficient_funds:
+  plan: [retry_later]
+  notes: "Retries succeed more often near month-start; space attempts >=24h."
+
+expired_card:
+  plan: [send_payment_link]
+  notes: "Retrying the same card almost never works; ask for a new method."
+
+bank_timeout:
+  plan: [retry_now, retry_later]
+  notes: "Often transient; one quick retry, then a spaced retry."
+
+mandate_cancelled:
+  plan: [send_mandate_link, handoff_human]
+  notes: "Never auto-retry a dead mandate - it breaches mandate terms."
+
+abandoned:
+  plan: [send_payment_link]
+  notes: "Customer never finished checkout; a link nudge is the lightest touch."
+
+unknown:
+  plan: [handoff_human]
+  notes: "Diagnoser could not classify - a human looks at it."
