@@ -34,36 +34,81 @@ from dunning import config, feed, llm
 # --------------------------------------------------------------------------- #
 
 _REASON_MAP = {
+    # funds / limits
     "insufficient_funds": "insufficient_funds",
+    "payment_limit_exceeded": "card_limit_exceeded",
+    "card_limit_exceeded": "card_limit_exceeded",
+    # transient infrastructure
+    "gateway_timeout": "bank_timeout",
+    "request_timeout": "bank_timeout",
+    "issuer_not_available": "issuer_unavailable",
+    "bank_not_available": "issuer_unavailable",
+    "server_error": "technical_decline",
+    "gateway_technical_error": "technical_decline",
+    # authentication
+    "authentication_failed": "three_ds_failed",
+    "3ds_authentication_failed": "three_ds_failed",
+    # instrument unusable
     "card_expired": "expired_card",
     "expired_card": "expired_card",
-    "gateway_technical_error": "bank_timeout",
-    "gateway_error": "bank_timeout",
-    "server_error": "bank_timeout",
+    "invalid_card_details": "invalid_payment_details",
+    "invalid_card_number": "invalid_payment_details",
+    "incorrect_card_details": "invalid_payment_details",
+    "international_not_allowed": "international_blocked",
+    "international_transaction_not_allowed": "international_blocked",
+    # issuer refusal
+    "payment_declined_by_bank": "do_not_honour",
+    "do_not_honour": "do_not_honour",
+    # security
+    "suspected_fraud": "card_declined_risk",
+    "fraudulent_payment": "card_declined_risk",
+    "card_reported_lost_or_stolen": "stolen_or_lost_card",
+    "card_reported_stolen": "stolen_or_lost_card",
+    "card_reported_lost": "stolen_or_lost_card",
+    # mandate
     "payment_mandate_revoked": "mandate_cancelled",
     "mandate_revoked": "mandate_cancelled",
 }
 
 # --------------------------------------------------------------------------- #
 # Stage 3: literal text rules. High precision only - anything that needs
-# interpretation is left for the LLM on purpose. Checked in this order.
+# interpretation is left for the LLM on purpose. Checked in this order (the
+# more specific / dangerous causes first).
 # --------------------------------------------------------------------------- #
 
 _TEXT_RULES = [
+    ("stolen_or_lost_card", re.compile(
+        r"reported (?:lost|stolen)|\bstolen\b|lost or stolen|resp(?:onse)? ?4[13]\b|pick ?up card", re.I)),
+    ("card_declined_risk", re.compile(
+        r"suspected fraud|\bfraud\b|risk (?:block|engine|flag)|security (?:reason|violation)|resp(?:onse)? ?59\b", re.I)),
     ("mandate_cancelled", re.compile(
         r"\bmandate\b|e-?nach|auto-?debit|\bautopay\b|token rejected|si (?:cancel|revok)", re.I)),
+    ("three_ds_failed", re.compile(
+        r"3-?d-?s(?:ecure)?|\b3ds\b|\bafa\b|\botp\b|authentication (?:failed|not completed)", re.I)),
+    ("international_blocked", re.compile(
+        r"international|cross-?border|overseas card|foreign card|card('?s)? country", re.I)),
     ("expired_card", re.compile(
-        r"\bexpired\b|\bexpiry\b|exp(?:iry)? ?(?:date|\d)|code 54|no longer valid", re.I)),
+        r"\bexpired\b|\bexpiry\b|exp(?:iry)? ?(?:date|\d)|resp(?:onse)? ?54\b", re.I)),
+    ("invalid_payment_details", re.compile(
+        r"invalid card (?:number|details)|incorrect card|bad cvv|resp(?:onse)? ?14\b", re.I)),
+    ("card_limit_exceeded", re.compile(
+        r"limit (?:exceeded|reached)|exceeds .{0,20}limit|withdrawal (?:limit|frequency)|resp(?:onse)? ?6[15]\b", re.I)),
+    ("issuer_unavailable", re.compile(
+        r"issuer (?:down|not available|unavailable|inoperative)|bank not available|resp(?:onse)? ?91\b", re.I)),
     ("abandoned", re.compile(
         r"\babandon|did ?n[o']t complete|0 payment attempts|no payment attempts? (?:logged|on)", re.I)),
     ("bank_timeout", re.compile(
         r"time ?d? ?out|\btimeout\b|no response|did not respond|\b50[24]\b|socket closed|upstream", re.I)),
+    ("do_not_honour", re.compile(
+        r"do not honou?r|\bdnh\b|resp(?:onse)? ?05\b|declined by (?:the )?issuing bank", re.I)),
+    ("technical_decline", re.compile(
+        r"technical (?:error|decline)|gateway_error|processor (?:error|technical)", re.I)),
     ("insufficient_funds", re.compile(
-        r"insuffic|insuff bal|\bnsf\b|do not honou?r|low funds|low bal\b|balance too low"
+        r"insuffic|insuff bal|\bnsf\b|low funds|low bal\b|balance too low"
         r"|reason code:? .{0,3}insufficient", re.I)),
 ]
 
-# below this, an LLM label is treated as "not confident enough" -> unknown
+# below this, an LLM label is treated as "not confident enough" -> needs_review
 _LLM_MIN_CONFIDENCE = 0.4
 
 
@@ -106,11 +151,11 @@ def diagnose(event: dict) -> Diagnosis:
 
         res = llm.classify_failure(text, choices=config.ROOT_CAUSES)
         stage = "llm_fake" if res.model == "fake" else ("llm_cache" if res.cached else "llm")
-        if res.label == "unknown" or res.confidence < _LLM_MIN_CONFIDENCE:
-            return Diagnosis("unknown", res.confidence, stage, f"{res.model}:{res.label}")
+        if res.label in ("needs_review", "unknown") or res.confidence < _LLM_MIN_CONFIDENCE:
+            return Diagnosis("needs_review", res.confidence, stage, f"{res.model}:{res.label}")
         return Diagnosis(res.label, res.confidence, stage, f"{res.model}:{res.label}")
 
-    return Diagnosis("unknown", 0.0, "none", "no error_reason or text")
+    return Diagnosis("needs_review", 0.0, "none", "no error_reason or text")
 
 
 def diagnose_batch(events) -> list:

@@ -44,7 +44,7 @@ CACHE_FILE = config.DATA_DIR / "llm_cache.json"
 
 @dataclass(frozen=True)
 class ClassifyResult:
-    label: str          # one of the allowed choices, or "unknown"
+    label: str          # one of the allowed choices, or "needs_review"
     confidence: float    # 0.0 .. 1.0
     model: str           # "gemini-2.0-flash" | "fake" | "none"
     cached: bool
@@ -146,7 +146,7 @@ def _call_gemini(prompt: str, *, temperature: float = 0.0) -> str:
 _CLASSIFY_PROMPT = """You classify a failed payment by its underlying root cause.
 
 Allowed root causes: {choices}
-Use "unknown" only when none of them clearly fits.
+Use "needs_review" only when none of them clearly fits.
 
 Reply with JSON and nothing else:
 {{"root_cause": "<one allowed value>", "confidence": <number between 0 and 1>}}
@@ -157,24 +157,47 @@ Failure message:
 
 # Offline heuristic. Deliberately broader than the diagnoser's (literal-only)
 # rules table - it leans on semantic cues - but it is a fixed list, so a real
-# Gemini key still classifies things this misses. Order matters: the more
-# specific causes are checked first.
+# Gemini key still classifies phrasings this misses. Order matters: the more
+# specific / dangerous causes are checked first.
 _FAKE_PATTERNS = [
+    ("stolen_or_lost_card", re.compile(
+        r"stolen|reported lost|lost or stolen|card .{0,15}compromised|seized|pick ?up card|resp ?4[13]\b", re.I)),
+    ("card_declined_risk", re.compile(
+        r"fraud|risk(?:y|-)? |flagged as risk|security reason|suspicious|must not (?:retry|attempt)|resp ?59\b", re.I)),
     ("mandate_cancelled", re.compile(
         r"mandate|auto[- ]?pay|autopay|auto[- ]?debit|e[- ]?nach|token rejected"
         r"|recurring permission|standing instruction|turned off auto|revok", re.I)),
+    ("three_ds_failed", re.compile(
+        r"3-?d-?s|\b3ds\b|\bafa\b|\botp\b|the code the bank sent|extra verification"
+        r"|additional (?:factor|verification)|authentication", re.I)),
+    ("international_blocked", re.compile(
+        r"international|cross-?border|overseas card|foreign card|outside india|card issued outside", re.I)),
     ("expired_card", re.compile(
         r"expired|expiry|exp\.? ?(?:date|\d)|code 54|too old|fresh card|new card"
-        r"|new instrument|no longer valid|instrument no longer", re.I)),
+        r"|new instrument|no longer valid", re.I)),
+    ("invalid_payment_details", re.compile(
+        r"invalid card|bad cvv|wrong (?:card )?details|does ?n[o']t map to a real account"
+        r"|can'?t match them|incorrect card|resp ?14\b", re.I)),
+    ("card_limit_exceeded", re.compile(
+        r"limit (?:exceeded|reached)|exceeds .{0,15}limit|withdrawal (?:limit|frequency)"
+        r"|per-?txn cap|card ceiling|spending limit|in a day|resp ?6[15]\b", re.I)),
+    ("issuer_unavailable", re.compile(
+        r"issuer (?:down|not available|unavailable|inoperative|isn'?t reachable)"
+        r"|bank (?:looks )?offline|bank not available|resp ?91\b", re.I)),
     ("abandoned", re.compile(
         r"abandon|never (?:reached|finished|completed)|did ?n[o']t complete"
         r"|dropped (?:at|off)|walked away|left the page|no attempt|0 payment attempts"
         r"|nothing was charged", re.I)),
     ("bank_timeout", re.compile(
         r"time ?d? ?out|no response|did not respond|50[24]\b|upstream|npci|flaky"
-        r"|hiccup|socket closed|bank.{0,20}down", re.I)),
+        r"|hiccup|socket closed|rail was slow|never came back", re.I)),
+    ("technical_decline", re.compile(
+        r"technical (?:error|decline)|gateway_error|processor|something broke"
+        r"|internal error|on the processing side", re.I)),
+    ("do_not_honour", re.compile(
+        r"do not honou?r|\bdnh\b|resp ?05\b|said no without|declined by (?:the )?issuing bank", re.I)),
     ("insufficient_funds", re.compile(
-        r"insuffic|insuff|low (?:funds|bal)|do not honou?r|\bnsf\b|not funded"
+        r"insuffic|insuff|low (?:funds|bal)|\bnsf\b|not funded"
         r"|funded enough|paycheck|salary|balance too low|not enough (?:funds|balance)", re.I)),
 ]
 
@@ -183,7 +206,7 @@ def _fake_classify(text: str, choices: Sequence[str]) -> tuple:
     for label, pattern in _FAKE_PATTERNS:
         if label in choices and pattern.search(text):
             return label, 0.75
-    return "unknown", 0.0
+    return "needs_review", 0.0
 
 
 def _parse_classify(raw: str, choices: Sequence[str]) -> tuple:
@@ -201,14 +224,14 @@ def _parse_classify(raw: str, choices: Sequence[str]) -> tuple:
     for label in choices:
         if label in low:
             return label, 0.5
-    return "unknown", 0.0
+    return "needs_review", 0.0
 
 
 def classify_failure(text: str, choices: Sequence[str] = config.ROOT_CAUSES) -> ClassifyResult:
     text = (text or "").strip()
     choices = list(choices)
     if not text:
-        return ClassifyResult("unknown", 0.0, "none", False)
+        return ClassifyResult("needs_review", 0.0, "none", False)
 
     provider = active_provider()
     if provider == "fake":
@@ -226,7 +249,7 @@ def classify_failure(text: str, choices: Sequence[str] = config.ROOT_CAUSES) -> 
     try:
         raw = _call_gemini(prompt)
     except Exception:
-        return ClassifyResult("unknown", 0.0, model, False)  # never break the batch
+        return ClassifyResult("needs_review", 0.0, model, False)  # never break the batch
 
     label, conf = _parse_classify(raw, choices)
     _cache_put(key, {

@@ -7,6 +7,14 @@ from dunning.generate import ROOT_CAUSE_WEIGHTS, generate_cases, main, write_cas
 RECOVERABLE_CAUSES = {c for w in ROOT_CAUSE_WEIGHTS.values() for c in w}
 
 
+def test_every_generated_cause_is_real_and_has_reason_pools():
+    from dunning.generate import _CLEAN_REASONS, _MESSY_REASONS
+    for cause in RECOVERABLE_CAUSES:
+        assert cause in config.ROOT_CAUSES and cause != "needs_review"
+        assert _CLEAN_REASONS.get(cause), cause
+        assert _MESSY_REASONS.get(cause), cause
+
+
 def test_deterministic_for_same_seed():
     assert generate_cases(150, seed=7) == generate_cases(150, seed=7)
 
@@ -29,7 +37,7 @@ def test_count_and_required_fields():
         assert c["case_id"].startswith("case_")
         assert c["kind"] in ("payment", "subscription")
         assert c["root_cause"] in RECOVERABLE_CAUSES
-        assert c["root_cause"] in config.ROOT_CAUSES and c["root_cause"] != "unknown"
+        assert c["root_cause"] in config.ROOT_CAUSES and c["root_cause"] != "needs_review"
         assert 99 <= c["amount_rupees"] <= 50000
         assert c["amount_paise"] == c["amount_rupees"] * 100
         assert c["currency"] == "INR"
@@ -104,9 +112,11 @@ def test_mandate_revokes_midway_subset():
     cases = generate_cases(300, seed=42)
     revoke = [c for c in cases if c["latent"]["mandate_revokes_at_attempt"] is not None]
     assert revoke, "expected at least one mandate-dies-mid-sequence case"
+    retry_safe = {"insufficient_funds", "bank_timeout", "do_not_honour",
+                  "issuer_unavailable", "technical_decline"}
     for c in revoke:
         assert c["kind"] == "subscription"
-        assert c["root_cause"] in ("insufficient_funds", "bank_timeout")
+        assert c["root_cause"] in retry_safe
         assert c["latent"]["mandate_revokes_at_attempt"] in (2, 3)
         assert c["latent"]["chronic"] is False
 

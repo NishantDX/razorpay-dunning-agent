@@ -50,15 +50,15 @@ def test_fake_classify_hits(monkeypatch, text, expected):
     assert res.label == expected and 0.0 < res.confidence <= 1.0
 
 
-def test_fake_classify_unknown(monkeypatch):
+def test_fake_classify_needs_review(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "")
     res = llm.classify_failure("the weather was nice and nothing else happened")
-    assert res.label == "unknown" and res.confidence == 0.0
+    assert res.label == "needs_review" and res.confidence == 0.0
 
 
-def test_empty_text_is_unknown():
+def test_empty_text_is_needs_review():
     res = llm.classify_failure("   ")
-    assert res.label == "unknown" and res.model == "none"
+    assert res.label == "needs_review" and res.model == "none"
 
 
 # --- JSON parsing ------------------------------------------------------- #
@@ -67,8 +67,8 @@ def test_empty_text_is_unknown():
     ('{"root_cause": "bank_timeout", "confidence": 0.9}', ("bank_timeout", 0.9)),
     ('```json\n{"root_cause":"expired_card","confidence":0.7}\n```', ("expired_card", 0.7)),
     ('the answer is insufficient_funds', ("insufficient_funds", 0.5)),
-    ('total gibberish here', ("unknown", 0.0)),
-    ('{"root_cause": "not_a_real_label", "confidence": 1}', ("unknown", 0.0)),
+    ('total gibberish here', ("needs_review", 0.0)),
+    ('{"root_cause": "not_a_real_label", "confidence": 1}', ("needs_review", 0.0)),
 ])
 def test_parse_classify(raw, expected):
     assert llm._parse_classify(raw, list(config.ROOT_CAUSES)) == expected
@@ -113,14 +113,14 @@ def test_gemini_failure_never_raises(monkeypatch):
 
     monkeypatch.setattr(llm, "_call_gemini", boom)
     res = llm.classify_failure("weird text the rules missed")
-    assert res.label == "unknown" and res.confidence == 0.0
+    assert res.label == "needs_review" and res.confidence == 0.0
     assert res.cached is False
 
 
 def test_choices_are_respected(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "")
-    res = llm.classify_failure("txn declnd - insuff bal", choices=["bank_timeout", "unknown"])
-    assert res.label == "unknown"  # insufficient_funds not offered
+    res = llm.classify_failure("txn declnd - insuff bal", choices=["bank_timeout", "needs_review"])
+    assert res.label == "needs_review"  # insufficient_funds not offered
 
 
 # --- write_message (provisional) ----------------------------------------- #

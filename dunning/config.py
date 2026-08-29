@@ -65,25 +65,64 @@ STOP_REASONS = (
     "mandate_dead",          # subscription mandate cancelled / revoked
     "max_retries_reached",
     "escalated_to_human",
+    "written_off",           # deliberately abandoned (e.g. value below effort)
 )
 
-# --- Canonical root causes: the diagnoser maps every raw reason to one of these ---
+# --- Canonical root causes -------------------------------------------------- #
+# The diagnoser maps every raw failure to exactly one of these. Grouped by how
+# recovery must be approached; the grouping drives the policy engine (step 5).
 ROOT_CAUSES = (
+    # funds / limits - the instrument is fine, the money or headroom is not
     "insufficient_funds",
-    "expired_card",
+    "card_limit_exceeded",
+    # transient infrastructure - likely to clear on its own
     "bank_timeout",
+    "issuer_unavailable",
+    "technical_decline",
+    # authentication - the charge needs the customer to re-authenticate
+    "three_ds_failed",
+    # instrument unusable - a different payment method is required
+    "expired_card",
+    "invalid_payment_details",
+    "international_blocked",
+    # issuer refused without a specific reason - do not hammer it
+    "do_not_honour",
+    # security - retrying is harmful; never do it
+    "card_declined_risk",
+    "stolen_or_lost_card",
+    # subscription mandate is dead
     "mandate_cancelled",
+    # no payment was ever attempted
     "abandoned",
-    "unknown",
+    # diagnoser not confident enough - a human decides
+    "needs_review",
 )
 
-# --- Interventions the policy engine may choose ---
+# Causes where re-attempting the SAME charge is a legitimate move.
+RETRY_SAFE_CAUSES = frozenset({
+    "insufficient_funds", "card_limit_exceeded", "bank_timeout",
+    "issuer_unavailable", "technical_decline", "do_not_honour",
+})
+# Causes where re-attempting is pointless or actively harmful.
+NEVER_RETRY_CAUSES = frozenset({
+    "card_declined_risk", "stolen_or_lost_card", "mandate_cancelled",
+    "expired_card", "invalid_payment_details", "international_blocked",
+})
+
+# --- Interventions the policy engine may choose --------------------------- #
 INTERVENTIONS = (
-    "retry_later",
-    "retry_now",
-    "switch_method",
-    "send_payment_link",
-    "send_mandate_link",
-    "handoff_human",
-    "do_nothing",
+    "retry_now",           # immediate re-attempt of the same charge
+    "retry_later",         # scheduled re-attempt of the same charge
+    "send_reminder",       # message only, no payment action
+    "send_payment_link",   # Razorpay Payment Link + message (any method)
+    "send_mandate_link",   # re-authorise the subscription mandate + message
+    "switch_method",       # re-attempt on a different instrument already on file
+    "handoff_human",       # escalate with a full case summary
+    "do_nothing",          # deliberately stop (e.g. value below recovery effort)
 )
+# Interventions that put a message in front of the customer (message cap applies).
+MESSAGE_INTERVENTIONS = frozenset({
+    "send_reminder", "send_payment_link", "send_mandate_link",
+})
+# Interventions that re-attempt the charge (retry cap applies).
+RETRY_INTERVENTIONS = frozenset({"retry_now", "retry_later"})

@@ -43,37 +43,65 @@ ACCOUNT_ID = "acc_SYNTH0000000000"
 
 EVENT_TYPES = ("payment.failed", "subscription.pending", "order.abandoned")
 
-# root cause -> the error fields Razorpay puts on a failed payment entity
+# root cause -> the error fields Razorpay puts on a failed payment entity.
+# error_reason values are modelled on Razorpay's reason codes / card-network
+# response codes; the diagnoser's _REASON_MAP is the counterpart lookup.
 _RZP_ERROR = {
     "insufficient_funds": {
-        "error_code": "BAD_REQUEST_ERROR",
-        "error_source": "bank",
-        "error_step": "payment_authorization",
-        "error_reason": "insufficient_funds",
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "bank",
+        "error_step": "payment_authorization", "error_reason": "insufficient_funds",
     },
-    "expired_card": {
-        "error_code": "BAD_REQUEST_ERROR",
-        "error_source": "customer",
-        "error_step": "payment_authentication",
-        "error_reason": "card_expired",
+    "card_limit_exceeded": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "bank",
+        "error_step": "payment_authorization", "error_reason": "payment_limit_exceeded",
     },
     "bank_timeout": {
-        "error_code": "GATEWAY_ERROR",
-        "error_source": "bank",
-        "error_step": "payment_authorization",
-        "error_reason": "gateway_technical_error",
+        "error_code": "GATEWAY_ERROR", "error_source": "gateway",
+        "error_step": "payment_authorization", "error_reason": "gateway_timeout",
+    },
+    "issuer_unavailable": {
+        "error_code": "GATEWAY_ERROR", "error_source": "bank",
+        "error_step": "payment_authorization", "error_reason": "issuer_not_available",
+    },
+    "technical_decline": {
+        "error_code": "GATEWAY_ERROR", "error_source": "gateway",
+        "error_step": "payment_authorization", "error_reason": "server_error",
+    },
+    "three_ds_failed": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "customer",
+        "error_step": "payment_authentication", "error_reason": "authentication_failed",
+    },
+    "expired_card": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "customer",
+        "error_step": "payment_authentication", "error_reason": "card_expired",
+    },
+    "invalid_payment_details": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "customer",
+        "error_step": "payment_initiation", "error_reason": "invalid_card_details",
+    },
+    "international_blocked": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "business",
+        "error_step": "payment_initiation", "error_reason": "international_not_allowed",
+    },
+    "do_not_honour": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "bank",
+        "error_step": "payment_authorization", "error_reason": "payment_declined_by_bank",
+    },
+    "card_declined_risk": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "bank",
+        "error_step": "payment_authorization", "error_reason": "suspected_fraud",
+    },
+    "stolen_or_lost_card": {
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "bank",
+        "error_step": "payment_authorization", "error_reason": "card_reported_lost_or_stolen",
     },
     "mandate_cancelled": {
-        "error_code": "BAD_REQUEST_ERROR",
-        "error_source": "customer",
-        "error_step": "payment_authorization",
-        "error_reason": "payment_mandate_revoked",
+        "error_code": "BAD_REQUEST_ERROR", "error_source": "customer",
+        "error_step": "payment_authorization", "error_reason": "payment_mandate_revoked",
     },
     "abandoned": {
-        "error_code": None,
-        "error_source": None,
-        "error_step": None,
-        "error_reason": None,
+        "error_code": None, "error_source": None,
+        "error_step": None, "error_reason": None,
     },
 }
 

@@ -35,7 +35,13 @@ def test_abandoned_event_needs_no_llm():
 @pytest.mark.parametrize("reason,expected", [
     ("insufficient_funds", "insufficient_funds"),
     ("card_expired", "expired_card"),
-    ("gateway_technical_error", "bank_timeout"),
+    ("gateway_timeout", "bank_timeout"),
+    ("issuer_not_available", "issuer_unavailable"),
+    ("server_error", "technical_decline"),
+    ("authentication_failed", "three_ds_failed"),
+    ("suspected_fraud", "card_declined_risk"),
+    ("card_reported_lost_or_stolen", "stolen_or_lost_card"),
+    ("payment_declined_by_bank", "do_not_honour"),
     ("payment_mandate_revoked", "mandate_cancelled"),
 ])
 def test_error_reason_lookup(reason, expected):
@@ -76,14 +82,14 @@ def test_semantic_text_goes_to_llm(text, expected):
     assert dx.stage == "llm_fake"
 
 
-def test_unrecognised_text_is_unknown():
-    dx = diagnose.diagnose(_payment_event(error_description="something odd we can't place"))
-    assert dx.root_cause == "unknown"
+def test_unrecognised_text_is_needs_review():
+    dx = diagnose.diagnose(_payment_event(error_description="the weather was pleasant today"))
+    assert dx.root_cause == "needs_review"
 
 
-def test_no_signal_at_all_is_unknown():
+def test_no_signal_at_all_is_needs_review():
     dx = diagnose.diagnose(_payment_event())
-    assert dx.root_cause == "unknown" and dx.stage == "none"
+    assert dx.root_cause == "needs_review" and dx.stage == "none"
 
 
 # --- batch behaviour ------------------------------------------------------ #
