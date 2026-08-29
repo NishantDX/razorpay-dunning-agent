@@ -16,8 +16,12 @@ Built for Track 3 (AI Revenue Recovery) of the Razorpay AI Buildathon.
 **Detect -> Diagnose -> Decide -> Act (within bounds) -> Measure**
 
 1. **Detect** - replay ~300 synthetic at-risk events (failed one-time payments + halted subscriptions).
-2. **Diagnose** - map each raw failure reason to one canonical root cause
-   (`insufficient_funds`, `expired_card`, `bank_timeout`, `mandate_cancelled`, `abandoned`).
+2. **Diagnose** - map each raw failure reason to one of 15 canonical root causes,
+   grouped by how recovery must work: retry-safe (`insufficient_funds`,
+   `bank_timeout`, `issuer_unavailable`, ...), needs-a-new-method (`expired_card`,
+   `international_blocked`, ...), never-retry (`card_declined_risk`,
+   `stolen_or_lost_card`, `mandate_cancelled`), `abandoned`, and `needs_review`
+   when the diagnoser isn't confident.
 3. **Decide** - a deterministic policy table picks the intervention
    (retry later / retry now / switch method / payment link / new mandate link / hand to human / do nothing).
 4. **Act** - execute via Razorpay test APIs with idempotency keys; after each attempt,
@@ -52,6 +56,7 @@ cp .env.example .env       # then fill in your keys
 make generate    # build the synthetic batch   -> data/cases.jsonl
 make feed        # shape it into a webhook feed -> data/events.jsonl
 make diagnose    # root-cause every event, scored vs ground truth
+make policy      # plan a bounded recovery for every event
 make run         # run the agent over the batch -> reports/latest.html
 make report      # open the report
 ```
@@ -106,23 +111,27 @@ docs/architecture.md the architecture doc
 
 ## Status
 
-**Step 4 of 13 complete:** the diagnoser (`dunning/diagnose.py`) + the LLM
-wrapper (`dunning/llm.py`).
+**Step 5 of 13 complete:** the policy engine (`dunning/policy.py` +
+`config/policy.yaml`).
 
 - **Step 2** — `make generate`: ~300 seeded at-risk cases → `data/cases.jsonl`,
   each with ground-truth `root_cause`, a customer profile, a raw failure reason
   (~15% deliberately messy), and hidden `latent` recovery parameters.
-- **Step 3** — `make feed`: each case → a Razorpay-webhook-shaped event
-  (`payment.failed` / `subscription.pending` / `order.abandoned`), time-ordered,
-  → `data/events.jsonl`; `feed.replay()` streams them one at a time. `latent`
-  never enters an event.
-- **Step 4** — `make diagnose`: a cheapest-first cascade turns each event into
-  one canonical root cause — (1) event type, (2) Razorpay's structured
-  `error_reason` code, (3) a literal text-rules table, (4) **LLM fallback**
-  (`llm.classify_failure`, Gemini) for the messy free-text that stages 1–3 can't
-  place. That fallback is the only place an LLM touches a money decision, and it
-  only *labels*. Every LLM answer is cached by input-hash → free, reproducible
-  re-runs. Offline heuristic scores ~99% against ground truth; ~28/300 events
-  reach the fallback.
+- **Step 3** — `make feed`: each case → a Razorpay-webhook-shaped event,
+  time-ordered, → `data/events.jsonl`; `feed.replay()` streams them one at a
+  time. `latent` never enters an event.
+- **Step 4** — `make diagnose`: a cheapest-first cascade maps each event to one
+  of **15 canonical root causes** — event type, Razorpay `error_reason` code, a
+  literal text-rules table, then an **LLM fallback** (Gemini) for messy free
+  text. The only place an LLM touches a money decision, and it only *labels*.
+  Cached by input-hash. ~99% against ground truth offline; unplaceable text →
+  `needs_review`, never a guess.
+- **Step 5** — `make policy`: turns a diagnosis + customer/subscription context
+  into a **fixed, bounded plan** — an ordered list of interventions with a
+  schedule. The cause→steps table lives in `config/policy.yaml` (readable
+  without touching code); context rules (unreachable customer, dead mandate,
+  low-value write-off, high-value risk escalation) live in `policy.py`. Never
+  retries a security block or a dead mandate; every plan ends in a human handoff
+  or a deliberate write-off; hard-capped at 3 retries / 2 messages.
 
-Next: the policy engine (step 5).
+Next: the executor (step 6) — real Razorpay test-mode API calls.

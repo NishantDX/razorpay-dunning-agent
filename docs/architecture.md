@@ -93,6 +93,51 @@ written to `data/llm_cache.json` keyed by a hash of the exact input, so re-runni
 the batch makes no API calls and is byte-for-byte reproducible. A failed API call
 returns `unknown` rather than raising — one flaky call must never break a batch.
 
+### Policy engine (`dunning/policy.py` + `config/policy.yaml`, step 5)
+
+`plan(root_cause, context) -> Plan` is a pure function. It produces a **fixed**
+ordered list of `Step`s (each an intervention + a minimum `Wait`), decided up
+front so the whole plan is auditable and testable before any action runs.
+
+The 15 causes map to one of eight **templates** in `config/policy.yaml` — the
+decision spine, readable without opening any code:
+
+| template | shape | causes |
+|---|---|---|
+| `transient` | retry_now → retry_later → human | bank_timeout, technical_decline |
+| `slow_transient` | retry_later(8h) → retry_later → human | issuer_unavailable |
+| `timing_problem` | reminder → retry at month-start → retry → human | insufficient_funds |
+| `one_retry_then_link` | retry_later → payment_link → human | do_not_honour, card_limit_exceeded |
+| `link_first` | payment_link → payment_link → human | expired_card, three_ds_failed, invalid_payment_details, international_blocked, card_declined_risk, abandoned |
+| `mandate_repair` | mandate_link → mandate_link → human | mandate_cancelled |
+| `do_not_reengage` | human only | stolen_or_lost_card |
+| `escalate` | human only | needs_review |
+
+`policy.py` then applies the **context adjustments** that are branch logic, not a
+table:
+
+1. **Dead mandate** on a subscription → the whole plan becomes `mandate_repair`,
+   whatever the diagnosed cause; the charge can't succeed until it's fixed, and
+   auto-retrying a dead mandate breaches its terms.
+2. **High-value risk block** (`card_declined_risk` ≥ ₹10,000) → straight to a
+   human; no link, no retry.
+3. **Unreachable customer** → drop reminder steps, turn link steps into a human
+   handoff (retries stay - they don't need the customer).
+4. **Low value** (< ₹150) → stop after the automated attempts; a manual touch
+   costs more than the money at stake (`do_nothing`, recorded as written off).
+5. **Guardrail clamp** — a safety net that guarantees ≤3 retries and ≤2 messages
+   even if a future template slips past the caps.
+
+Every plan ends in `handoff_human` or `do_nothing` — the agent never just stops.
+`Plan.replan_allowed` is `False` for `stolen_or_lost_card`, `card_declined_risk`
+and `needs_review` (and after a high-value escalation); for everything else the
+executor may request **one** re-plan if a later attempt fails with a materially
+different cause (step 12's mandate-dies-mid-sequence is exactly this).
+
+`schedule(plan, t0)` resolves each `Wait` to an earliest datetime (including
+"next month-start"); the ≥24h spacing and the 09:00–20:00 contact window are
+layered on by the guardrails in step 7, not here.
+
 ## Where we deliberately did NOT use an LLM, and why
 
 The retry schedule, every limit and stopping rule, all money math, the "did it

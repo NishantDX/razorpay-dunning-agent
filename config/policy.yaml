@@ -1,27 +1,145 @@
-# Root cause -> intervention plan. Consumed by dunning/policy.py (step 5).
-# This file is deterministic policy: plain data, fully auditable, no code.
-# TODO (step 5): fill in the real decision table, schedules, and customer-context rules.
+# Recovery policy - failure cause -> ordered recovery steps.
+#
+# Deterministic. No AI. `dunning/policy.py` reads this file; the executor
+# (step 6) walks the plan; the guardrails in `dunning/config.py` cap it
+# (<=3 retries, >=24h apart, 09:00-20:00 contact window, <=2 messages).
+#
+# Each step is {action, wait}:
+#   action  - a value from config.INTERVENTIONS
+#   wait    - the MINIMUM delay before the step, resolved by the scheduler:
+#               {after_hours: N}                  N hours after the previous step
+#                                                 (or after t0 for the first step)
+#               {at: month_start, within_hours: N}  at the next 1st of a month
+#
+# The cause -> template mapping is the whole decision spine and is meant to be
+# read top to bottom. Context-sensitive tweaks (unreachable customer, dead
+# mandate, low-value write-off, high-value risk escalation) are applied in
+# policy.py, not here - they are branch logic, not a table.
 
-insufficient_funds:
-  plan: [retry_later]
-  notes: "Retries succeed more often near month-start; space attempts >=24h."
+version: 2
 
-expired_card:
-  plan: [send_payment_link]
-  notes: "Retrying the same card almost never works; ask for a new method."
+templates:
 
-bank_timeout:
-  plan: [retry_now, retry_later]
-  notes: "Often transient; one quick retry, then a spaced retry."
+  transient:                       # a blip - try again quickly, then spaced, then a person
+    - {action: retry_now,     wait: {after_hours: 1}}
+    - {action: retry_later,   wait: {after_hours: 24}}
+    - {action: handoff_human, wait: {after_hours: 24}}
 
-mandate_cancelled:
-  plan: [send_mandate_link, handoff_human]
-  notes: "Never auto-retry a dead mandate - it breaches mandate terms."
+  slow_transient:                  # issuer outage - wait hours, not minutes, before retrying
+    - {action: retry_later,   wait: {after_hours: 8}}
+    - {action: retry_later,   wait: {after_hours: 24}}
+    - {action: handoff_human, wait: {after_hours: 24}}
 
-abandoned:
-  plan: [send_payment_link]
-  notes: "Customer never finished checkout; a link nudge is the lightest touch."
+  timing_problem:                  # the money will arrive - time the retry to payday
+    - {action: send_reminder, wait: {after_hours: 2}}
+    - {action: retry_later,   wait: {at: month_start, within_hours: 48}}
+    - {action: retry_later,   wait: {after_hours: 30}}
+    - {action: handoff_human, wait: {after_hours: 24}}
 
-unknown:
-  plan: [handoff_human]
-  notes: "Diagnoser could not classify - a human looks at it."
+  one_retry_then_link:            # issuer refused - one spaced retry, then switch method
+    - {action: retry_later,       wait: {after_hours: 24}}
+    - {action: send_payment_link, wait: {after_hours: 2}}
+    - {action: handoff_human,     wait: {after_hours: 24}}
+
+  link_first:                     # this instrument won't work - the customer needs a new one
+    - {action: send_payment_link, wait: {after_hours: 1}}
+    - {action: send_payment_link, wait: {after_hours: 48}}
+    - {action: handoff_human,     wait: {after_hours: 24}}
+
+  mandate_repair:                 # the mandate is dead - re-authorise it, never retry the charge
+    - {action: send_mandate_link, wait: {after_hours: 1}}
+    - {action: send_mandate_link, wait: {after_hours: 48}}
+    - {action: handoff_human,     wait: {after_hours: 24}}
+
+  do_not_reengage:               # lost / stolen card - hand to a person, do not chase
+    - {action: handoff_human,     wait: {after_hours: 1}}
+
+  escalate:                      # not classified - a person decides before any money action
+    - {action: handoff_human,     wait: {after_hours: 0}}
+
+causes:
+
+  insufficient_funds:
+    template: timing_problem
+    rationale: >
+      Funds problem, not an instrument problem: a gentle reminder, a retry at
+      month-start when salaries typically land, one more spaced retry, then a human.
+
+  card_limit_exceeded:
+    template: one_retry_then_link
+    rationale: >
+      A daily card limit usually resets overnight - one retry after 24h; if the
+      wall is a hard credit limit, a link lets the customer pay another way.
+
+  bank_timeout:
+    template: transient
+    rationale: >
+      Usually a momentary blip: one quick retry, one spaced retry, then a human.
+
+  technical_decline:
+    template: transient
+    rationale: >
+      Processor-side technical error with no money moved - handled like a timeout.
+
+  issuer_unavailable:
+    template: slow_transient
+    rationale: >
+      The issuing bank is down; retrying in minutes just fails again. Wait hours.
+
+  three_ds_failed:
+    template: link_first
+    rationale: >
+      The customer has to re-authenticate (OTP / AFA) - a silent retry cannot do
+      that. Send a link so they complete authentication themselves.
+
+  expired_card:
+    template: link_first
+    rationale: >
+      The card is dead; retrying it is pointless. Ask for a different method.
+
+  invalid_payment_details:
+    template: link_first
+    rationale: >
+      The details were wrong - the customer must re-enter them, which only a link
+      lets them do.
+
+  international_blocked:
+    template: link_first
+    rationale: >
+      This card cannot be used for this transaction; a link lets the customer
+      pick a domestic method.
+
+  do_not_honour:
+    template: one_retry_then_link
+    rationale: >
+      The issuer refused without a reason. Issuers rate-limit repeated attempts,
+      so exactly one spaced retry, then switch method.
+
+  card_declined_risk:
+    template: link_first
+    rationale: >
+      A risk block - never retry the same charge. Offer a different instrument;
+      a high-value transaction goes straight to a human (applied in policy.py).
+
+  stolen_or_lost_card:
+    template: do_not_reengage
+    rationale: >
+      The card was reported lost or stolen: do not retry, do not chase the
+      customer - a person handles it.
+
+  mandate_cancelled:
+    template: mandate_repair
+    rationale: >
+      The mandate is dead; auto-retrying the charge would breach its terms.
+      Re-authorise the mandate, then a human.
+
+  abandoned:
+    template: link_first
+    rationale: >
+      No payment was ever attempted - a payment link is the only move.
+
+  needs_review:
+    template: escalate
+    rationale: >
+      The diagnoser was not confident enough; a person looks before any money
+      action is taken.
