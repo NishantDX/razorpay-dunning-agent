@@ -61,13 +61,48 @@ created" monitor). The case is linked back to its event through
 `latent` block is never copied into an event: the agent sees only what a webhook
 would carry; `latent` stays with the executor.
 
+### Diagnoser (`dunning/diagnose.py`, step 4)
+
+`diagnose(event) -> Diagnosis` maps one event to one canonical root cause via a
+cheapest-first cascade:
+
+| stage | source | AI? | share of batch |
+|---|---|---|---|
+| `event` | an `order.abandoned` event *is* the diagnosis | no | ~6% |
+| `error_reason` | Razorpay's structured code (`insufficient_funds`, `card_expired`, `gateway_technical_error`, `payment_mandate_revoked`, …) via a lookup table | no | ~78% |
+| `text_rules` | a small, deliberately *literal* regex table over `error_description` ("expired", "timeout", "insuff bal", "504", "mandate", …) | no | ~7% |
+| `llm` | `llm.classify_failure` — only free text stages above couldn't place | **yes** | ~9% |
+
+The `Diagnosis` records the label, a confidence, the stage, and the exact signal
+it matched, so every classification is auditable. An LLM label below 0.4
+confidence, or `unknown`, is recorded as `unknown` (the policy engine escalates
+those to a human rather than guessing).
+
+The text-rules table is kept intentionally conservative — literal tokens only.
+Anything that needs interpretation ("the paycheck is late this month", "issuer
+bank was flaky") is left for the LLM on purpose; that split is the whole point of
+having both.
+
+### LLM wrapper (`dunning/llm.py`)
+
+The single module that calls an LLM. Two jobs: `classify_failure()` (step 4) and
+`write_message()` (step 8, provisional). Provider is `LLM_PROVIDER` (default
+Gemini); with no `GEMINI_API_KEY` it falls back to a deterministic offline
+heuristic so the pipeline and tests run with zero setup. Every real answer is
+written to `data/llm_cache.json` keyed by a hash of the exact input, so re-running
+the batch makes no API calls and is byte-for-byte reproducible. A failed API call
+returns `unknown` rather than raising — one flaky call must never break a batch.
+
 ## Where we deliberately did NOT use an LLM, and why
 
-_TODO. Short version: the retry schedule, every limit and stopping rule, all money math,
-the "did it arrive?" check, the audit log, and the metrics are plain deterministic code.
-An LLM is non-deterministic and hard to audit; money decisions must be reproducible and
-explainable line by line. The LLM is used only where fuzziness is the point:
-(a) normalising messy free-text failure reasons, (b) writing the customer message._
+The retry schedule, every limit and stopping rule, all money math, the "did it
+arrive?" check, the audit log, and every metric are plain deterministic code.
+Money decisions must be reproducible and explainable line by line; an LLM is
+non-deterministic and hard to audit. Even inside the diagnoser, ~91% of events
+are classified by lookup tables and literal rules — the LLM only sees the ~9%
+of genuinely messy free text, and even then it only *labels*: it never chooses
+an action, a schedule, or an amount. The other LLM use is writing the customer
+nudge message (step 8), where natural phrasing is the point.
 
 ## Guardrails
 

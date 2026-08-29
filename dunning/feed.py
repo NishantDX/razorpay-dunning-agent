@@ -103,6 +103,10 @@ def _payment_method(case: dict) -> str:
 def _payment_entity(case: dict, *, failed: bool) -> dict:
     cust = case["customer"]
     err = _RZP_ERROR[case["root_cause"]]
+    # When the failure text is messy, the structured error_reason is typically
+    # missing / generic too - that is *why* someone had to write free text. So we
+    # withhold the clean machine code here and let the diagnoser work the text.
+    machine_reason = None if case["reason_is_messy"] else err["error_reason"]
     return {
         "id": case["payment_id"] or ("pay_" + case["case_id"].split("_")[1] + "FAILED"),
         "entity": "payment",
@@ -122,7 +126,7 @@ def _payment_entity(case: dict, *, failed: bool) -> dict:
         "error_description": case["raw_failure_reason"],
         "error_source": err["error_source"],
         "error_step": err["error_step"],
-        "error_reason": err["error_reason"],
+        "error_reason": machine_reason,
         "created_at": _unix(case["failed_at"]),
     }
 

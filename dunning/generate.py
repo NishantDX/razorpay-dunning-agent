@@ -123,31 +123,49 @@ _CLEAN_REASONS = {
     ],
 }
 
+# Messy free-text reasons. Roughly half carry a literal keyword the diagnoser's
+# rules table can still catch; the rest only have *semantic* signal (no "expired"
+# / "timeout" / "mandate" token) and fall through to the LLM classifier.
 _MESSY_REASONS = {
     "insufficient_funds": [
         "txn declnd - insuff bal, cust says salary comes on 1st",
         "ERR 51 do not honour / low funds",
         "NACH return - reason code: 'insufficient funds'",
+        "bank says the account isn't funded enough this cycle",
+        "customer told us the paycheck is late this month",
+        "declined - available limit was lower than the amount",
     ],
     "expired_card": [
-        "card 4xxxxx exp 06/25 -> reattempt w new instrument",
         "resp code 54 expired card, pls ask cust to update",
         "vault card dead, tokenisation failed, exp date in past",
+        "card 4xxxxx exp 06/25 -> reattempt w new instrument",
+        "the card on file is too old now, issuer won't take it",
+        "need the customer to add a fresh card, current one won't go through",
+        "instrument no longer valid per the bank, ask for another",
     ],
     "bank_timeout": [
         "UPI timeout @ NPCI, RRN not generated, maybe retry",
         "no response frm issuer after 30s, socket closed",
         "PG error: upstream timed out (504) mid-auth",
+        "issuer bank was flaky just now, seeing a lot of these",
+        "gateway hiccup, nothing was deducted, probably retryable",
+        "the bank's system looked down during the attempt",
     ],
     "mandate_cancelled": [
+        "sub charge fail: mandate status = REVOKED",
         "auto-debit bounced, e-mandate not active anymore",
         "token rejected by bank - customer cancelled autopay",
-        "sub charge fail: mandate status = REVOKED",
+        "customer pulled the recurring permission from their bank app",
+        "standing instruction is no longer on file at the bank",
+        "they turned off auto-pay for us, charge won't go now",
     ],
     "abandoned": [
-        "cust called - says they never reached the payment page",
         "order stuck in 'created', 0 payment attempts logged",
         "link opened, no txn - customer dropped at the OTP screen",
+        "cust called - says they never reached the payment page",
+        "checkout was opened but the customer walked away before paying",
+        "no attempt on this one, they just never finished",
+        "customer left the page, nothing was charged",
     ],
 }
 

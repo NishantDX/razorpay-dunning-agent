@@ -49,11 +49,16 @@ cp .env.example .env       # then fill in your keys
 ## Run
 
 ```bash
-make generate    # build the synthetic batch  -> data/cases.jsonl
+make generate    # build the synthetic batch   -> data/cases.jsonl
 make feed        # shape it into a webhook feed -> data/events.jsonl
+make diagnose    # root-cause every event, scored vs ground truth
 make run         # run the agent over the batch -> reports/latest.html
 make report      # open the report
 ```
+
+Without a `GEMINI_API_KEY` the diagnoser's LLM fallback uses a small offline
+heuristic so everything runs with zero setup; set the key in `.env` for the real
+Gemini classifier.
 
 ## Headline result
 
@@ -101,16 +106,23 @@ docs/architecture.md the architecture doc
 
 ## Status
 
-**Step 3 of 13 complete:** the event feed (`dunning/feed.py`).
+**Step 4 of 13 complete:** the diagnoser (`dunning/diagnose.py`) + the LLM
+wrapper (`dunning/llm.py`).
 
-- **Step 2** — `make generate` writes ~300 seeded at-risk cases to
-  `data/cases.jsonl` (+ `data/cases.meta.json`). Each carries ground-truth
-  `root_cause`, a customer profile, a raw failure reason (~15% deliberately
-  messy), and hidden `latent` parameters the executor rolls a seeded RNG against.
-- **Step 3** — `make feed` turns each case into an event shaped like a real
-  Razorpay webhook (`payment.failed`, `subscription.pending`, `order.abandoned`),
-  ordered by failure time, written to `data/events.jsonl`. `feed.replay()` yields
-  them one at a time, as if Razorpay were POSTing them to us. The hidden `latent`
-  block is not copied into events — the agent only ever sees the webhook.
+- **Step 2** — `make generate`: ~300 seeded at-risk cases → `data/cases.jsonl`,
+  each with ground-truth `root_cause`, a customer profile, a raw failure reason
+  (~15% deliberately messy), and hidden `latent` recovery parameters.
+- **Step 3** — `make feed`: each case → a Razorpay-webhook-shaped event
+  (`payment.failed` / `subscription.pending` / `order.abandoned`), time-ordered,
+  → `data/events.jsonl`; `feed.replay()` streams them one at a time. `latent`
+  never enters an event.
+- **Step 4** — `make diagnose`: a cheapest-first cascade turns each event into
+  one canonical root cause — (1) event type, (2) Razorpay's structured
+  `error_reason` code, (3) a literal text-rules table, (4) **LLM fallback**
+  (`llm.classify_failure`, Gemini) for the messy free-text that stages 1–3 can't
+  place. That fallback is the only place an LLM touches a money decision, and it
+  only *labels*. Every LLM answer is cached by input-hash → free, reproducible
+  re-runs. Offline heuristic scores ~99% against ground truth; ~28/300 events
+  reach the fallback.
 
-Next: the diagnoser (step 4).
+Next: the policy engine (step 5).
