@@ -42,6 +42,25 @@ fast-forwards between attempts, so the >=24h-gap rule, the 09:00-20:00 contact
 window, and the salary-day timing pattern genuinely function without waiting in
 real time.
 
+### Event feed (`dunning/feed.py`, step 3)
+
+In production the agent is triggered by a **Razorpay webhook** - an HTTP POST
+Razorpay sends us when a payment fails or a subscription charge bounces. We can't
+receive those (no public server, no real failing payments in test mode), so the
+brief's instruction is to replay them from a file. `feed.py` turns each case into
+an event with the same envelope a real webhook delivery has
+(`entity: "event"`, `account_id`, `event`, `contains`, `payload.<entity>.entity`,
+unix `created_at`), sorts them by failure time, and writes `data/events.jsonl`.
+`replay()` yields them one at a time in order.
+
+Event types: `payment.failed` and `subscription.pending` are real Razorpay
+events; `order.abandoned` is our own stand-in (Razorpay fires nothing for a pure
+abandonment - in production this would come from our own "order stuck in
+created" monitor). The case is linked back to its event through
+`notes.case_id` (Razorpay `notes` is a real free-form field). The hidden
+`latent` block is never copied into an event: the agent sees only what a webhook
+would carry; `latent` stays with the executor.
+
 ## Where we deliberately did NOT use an LLM, and why
 
 _TODO. Short version: the retry schedule, every limit and stopping rule, all money math,

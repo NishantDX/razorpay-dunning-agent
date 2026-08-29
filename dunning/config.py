@@ -23,6 +23,7 @@ for _d in (DATA_DIR, REPORTS_DIR, LOGS_DIR):
     _d.mkdir(exist_ok=True)
 
 CASES_FILE = DATA_DIR / "cases.jsonl"
+EVENTS_FILE = DATA_DIR / "events.jsonl"
 AUDIT_LOG = LOGS_DIR / "audit.jsonl"
 
 

@@ -49,7 +49,8 @@ cp .env.example .env       # then fill in your keys
 ## Run
 
 ```bash
-make generate    # build the synthetic batch -> data/cases.jsonl
+make generate    # build the synthetic batch  -> data/cases.jsonl
+make feed        # shape it into a webhook feed -> data/events.jsonl
 make run         # run the agent over the batch -> reports/latest.html
 make report      # open the report
 ```
@@ -100,9 +101,16 @@ docs/architecture.md the architecture doc
 
 ## Status
 
-**Step 2 of 13 complete:** synthetic data generator (`dunning/generate.py`).
-`make generate` writes ~300 seeded at-risk cases to `data/cases.jsonl` plus a
-`data/cases.meta.json` summary. Each case carries ground-truth `root_cause`, a
-customer profile, a raw failure reason (~15% deliberately messy), and hidden
-`latent` parameters the executor will roll a seeded RNG against to decide whether
-money actually arrives. Next: the event feed (step 3).
+**Step 3 of 13 complete:** the event feed (`dunning/feed.py`).
+
+- **Step 2** — `make generate` writes ~300 seeded at-risk cases to
+  `data/cases.jsonl` (+ `data/cases.meta.json`). Each carries ground-truth
+  `root_cause`, a customer profile, a raw failure reason (~15% deliberately
+  messy), and hidden `latent` parameters the executor rolls a seeded RNG against.
+- **Step 3** — `make feed` turns each case into an event shaped like a real
+  Razorpay webhook (`payment.failed`, `subscription.pending`, `order.abandoned`),
+  ordered by failure time, written to `data/events.jsonl`. `feed.replay()` yields
+  them one at a time, as if Razorpay were POSTing them to us. The hidden `latent`
+  block is not copied into events — the agent only ever sees the webhook.
+
+Next: the diagnoser (step 4).

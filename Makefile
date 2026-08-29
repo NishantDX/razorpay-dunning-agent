@@ -1,4 +1,4 @@
-.PHONY: setup generate run report test clean
+.PHONY: setup generate feed run report test clean
 
 VENV=.venv
 PY=$(VENV)/bin/python
@@ -13,6 +13,9 @@ setup:
 
 generate:
 	$(PY) -m dunning.generate
+
+feed:
+	$(PY) -m dunning.feed
 
 run:
 	$(PY) -m dunning.run_batch
