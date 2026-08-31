@@ -68,12 +68,18 @@ Gemini classifier.
 
 ## Headline result
 
-_Filled in after the first full run._
+Seed 42, 300 synthetic at-risk cases (₹14,57,038 total). Offline run
+(`RANDOM_SEED=42 make run`); deterministic. Numbers regenerate into
+`reports/latest.html`.
 
-| Strategy | Recovered | % of at-risk value | Avg attempts | Escalated | Rule violations |
-|---|---|---|---|---|---|
-| Naive (one retry, then give up) | TBD | TBD | TBD | TBD | TBD |
-| **Dunning Agent** | **TBD** | **TBD** | TBD | TBD | **0** |
+| Strategy | Recovered | % of at-risk value | Avg attempts | Within the rules |
+|---|---|---|---|---|
+| Naive — one blind retry | ₹3,32,679 | 22.8% | 1.00 | — retries dead mandates / risk blocks |
+| Blind — three retries 1h apart | ₹6,65,895 | 45.7% | 3.00 | ✗ breaks the ≥24h rule, hammers issuers |
+| **Dunning Agent** | **₹7,98,285** | **54.8%** | 2.04 | ✓ 0 violations, 0 double charges |
+
+The blind strategies only score higher than a single retry by doing things a real
+payments stack forbids. The agent's number is the one you could ship.
 
 ## Guardrails
 
@@ -112,8 +118,7 @@ docs/architecture.md the architecture doc
 
 ## Status
 
-**Step 5 of 13 complete:** the policy engine (`dunning/policy.py` +
-`config/policy.yaml`).
+**Steps 1–10 of 13 complete.** The full pipeline runs end to end with `make run`.
 
 - **Step 2** — `make generate`: ~300 seeded at-risk cases → `data/cases.jsonl`,
   each with ground-truth `root_cause`, a customer profile, a raw failure reason
@@ -161,5 +166,13 @@ docs/architecture.md the architecture doc
   the record count and a fingerprint of the guardrail/policy config.
   `make verify-audit` recomputes the chain and checks the manifest; editing or
   dropping any line is caught.
+- **Step 10** — `make run` = the whole pipeline in one command → a designed,
+  self-contained `reports/latest.html` (inline CSS, no JS, no CDN): the headline
+  ₹ recovered, the agent vs. two naive baselines (both non-compliant — that's the
+  point), recovery by cause, bounds & safety tiles, where AI was used, example
+  case timelines, and a reproducibility footer with the audit chain head. Latest
+  run: **54.8% of at-risk value recovered** vs 22.8% (one blind retry) and 45.7%
+  (three blind retries that break the ≥24h rule), 0 violations, 0 double charges.
 
-Next: the batch runner + HTML report (step 10).
+Next: step 11 (flesh out the baseline), 12 (deliberate-failure showcase),
+13 (dev journal + pitch).

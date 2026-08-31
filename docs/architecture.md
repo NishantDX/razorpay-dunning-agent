@@ -263,10 +263,38 @@ _TODO: pull from `dunning/config.py` - max 3 retries, >=24h apart, contact only
 recovered, customer reply (paid / stop / dispute / unsubscribe), dead mandate,
 max retries, human escalation._
 
+### Batch runner + report (`dunning/run_batch.py`, `dunning/report.py`, step 10)
+
+`run(seed, count)` does the whole pipeline in one call — generate → sign feed →
+per event: verify signature → diagnose → plan → execute → audit — then runs the
+naive baselines over the *same* cases and seed and hands a `RunResult` to
+`report.write`, which renders one self-contained `reports/latest.html` (inline
+CSS, no JS, no CDN). Single seed; deterministic; the seed is on the report.
+
 ## Metrics definitions
 
-_TODO: define each headline number precisely (what counts as "recovered", how attempts
-are counted, what "escalated" means, how the naive baseline is computed)._
+- **at-risk value** — sum of `amount_paise` over every case in the run.
+- **recovered** — a case whose `ExecutionResult.recovered` is true, i.e. an
+  attempt's simulated outcome (rolled from `latent`) came back as money in. Its
+  full amount counts once; partial recovery is not modelled.
+- **% of at-risk value** — recovered paise ÷ at-risk paise.
+- **avg attempts** — mean length of the per-case attempt log (skipped / deferred
+  rows included, since they are still decisions the agent made).
+- **escalated** — `stop_reason == "escalated_to_human"`.
+- **written off** — `stop_reason == "written_off"` (value below the cost of a
+  manual touch).
+- **guardrail violations** — `guardrails.count_violations`: an independent
+  recomputation from the finished logs (retries > 3, messages > 2, a retry gap
+  < 24h, a message outside 09:00–20:00, or the action hard cap exceeded),
+  counting only steps actually carried out. Structurally 0.
+- **double charges** — a second gateway create for an idempotency key already
+  seen. 0 by construction; the count of short-circuited duplicate calls is shown
+  separately.
+- **naive baseline** — `baseline.naive_one_retry`: one immediate retry, then
+  give up. **blind baseline** — `baseline.blind_three`: three retries an hour
+  apart. Both share the executor's outcome oracle and per-case seed, so they roll
+  the same random numbers as the agent; only the decision logic differs. Neither
+  respects the guardrails, which is the point of showing them.
 
 ## What broke, and how I got out
 

@@ -31,6 +31,7 @@ verify-audit:
 
 run:
 	$(PY) -m dunning.run_batch
+	@open reports/latest.html 2>/dev/null || true
 
 report:
 	@open reports/latest.html 2>/dev/null || echo "No report yet - run 'make run' first."

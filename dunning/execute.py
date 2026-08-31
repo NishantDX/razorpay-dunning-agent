@@ -87,6 +87,7 @@ class RazorpayGateway:
         self._store_path = Path(store_path) if store_path else None
         self._by_key: dict = {}
         self.calls: list = []      # (method, idempotency_key) - for audit / tests
+        self.dedupe_hits = 0       # repeated idempotency key -> a prevented double action
         if self._store_path and self._store_path.exists():
             try:
                 self._by_key = json.loads(self._store_path.read_text("utf-8"))
@@ -117,6 +118,7 @@ class RazorpayGateway:
     # -- public --
     def create_order(self, amount_paise: int, notes: dict, idempotency_key: str) -> dict:
         if idempotency_key in self._by_key:
+            self.dedupe_hits += 1
             return self._by_key[idempotency_key]
         self.calls.append(("create_order", idempotency_key))
         if self.live:
@@ -131,6 +133,7 @@ class RazorpayGateway:
     def create_payment_link(self, amount_paise: int, *, customer: dict, description: str,
                             idempotency_key: str) -> dict:
         if idempotency_key in self._by_key:
+            self.dedupe_hits += 1
             return self._by_key[idempotency_key]
         self.calls.append(("create_payment_link", idempotency_key))
         if self.live:
