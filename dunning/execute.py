@@ -38,7 +38,7 @@ from pathlib import Path
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from dunning import config, diagnose, feed, guardrails, llm, policy, redact
+from dunning import config, diagnose, feed, guardrails, messaging, policy, redact
 
 G = config.GUARDRAILS
 M = config.MONEY
@@ -230,6 +230,13 @@ def _cause_shift(case: dict, actions_taken: int) -> str:
 # Result types
 # --------------------------------------------------------------------------- #
 
+_MSG_ASK = {
+    "send_reminder": "retry",
+    "send_payment_link": "pay_link",
+    "send_mandate_link": "reauthorise_mandate",
+}
+
+
 @dataclass
 class Attempt:
     index: int
@@ -240,6 +247,7 @@ class Attempt:
     ref: str = ""
     idempotency_key: str = ""
     detail: str = ""
+    messages: dict = field(default_factory=dict)   # channel -> body (for the audit log)
 
 
 @dataclass
@@ -258,6 +266,18 @@ class ExecutionResult:
 
 def _idem(case_id: str, index: int, action: str) -> str:
     return f"dun_{case_id}_{index}_{action}"
+
+
+def _compose_messages(case: dict, action: str, link_url: str = "") -> tuple:
+    """Returns (messages_by_channel, short_summary_for_the_attempt_detail)."""
+    msgs = messaging.compose(customer_name=case["customer"]["name"],
+                             amount_rupees=case["amount_rupees"],
+                             language=case["customer"]["language"],
+                             ask=_MSG_ASK.get(action, "retry"), link_url=link_url)
+    bodies = {ch: m.body for ch, m in msgs.items()}
+    tmpl = any(m.from_template for m in msgs.values())
+    summary = redact.sanitize(bodies["sms"][:90]) + (" [template]" if tmpl else "")
+    return bodies, summary
 
 
 # --------------------------------------------------------------------------- #
@@ -379,31 +399,31 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
                     detail=redact.sanitize(f"{type(exc).__name__}: {exc}"))
                 return finish("escalated_to_human", False)
             ledger.record(step.action, at)
+            bodies, summary = _compose_messages(case, step.action, link["short_url"])
             reply = _customer_reply(case, reply_rng)
             if reply:
                 add(step.action, scheduled_at, at, ref=link["id"], idempotency_key=key,
-                    outcome="customer_opted_out", detail=f"customer replied {reply!r}")
+                    outcome="customer_opted_out", detail=f"customer replied {reply!r}",
+                    messages=bodies)
                 return finish("customer_opted_out", False)
             ok = _recovered(case, step.action, clock, out_rng)
             add(step.action, scheduled_at, at, ref=link["id"], idempotency_key=key,
-                outcome="recovered" if ok else "sent", detail=defer_note)
+                outcome="recovered" if ok else "sent",
+                detail=(defer_note + " " + summary).strip(), messages=bodies)
             if ok:
                 return finish("recovered", True)
             continue
 
         # --- reminder (message only) ---
         if step.action == "send_reminder":
-            msg = llm.write_message(customer_name=case["customer"]["name"],
-                                    amount_rupees=case["amount_rupees"],
-                                    language=case["customer"]["language"], ask="retry")
             ledger.record(step.action, at)
+            bodies, summary = _compose_messages(case, step.action)
             reply = _customer_reply(case, reply_rng)
             if reply:
                 add(step.action, scheduled_at, at, outcome="customer_opted_out",
-                    detail=f"customer replied {reply!r}")
+                    detail=f"customer replied {reply!r}", messages=bodies)
                 return finish("customer_opted_out", False)
-            add(step.action, scheduled_at, at, outcome="sent",
-                detail=redact.sanitize(msg.text[:90]))
+            add(step.action, scheduled_at, at, outcome="sent", detail=summary, messages=bodies)
             continue
 
         # --- terminal steps ---
@@ -439,7 +459,8 @@ def result_to_dict(r: ExecutionResult) -> dict:
         "attempts": [
             {"index": a.index, "action": a.action, "outcome": a.outcome,
              "scheduled_at": a.scheduled_at.isoformat(), "at": a.at.isoformat(),
-             "ref": a.ref, "idempotency_key": a.idempotency_key, "detail": a.detail}
+             "ref": a.ref, "idempotency_key": a.idempotency_key, "detail": a.detail,
+             "messages": a.messages}
             for a in r.attempts
         ],
     }

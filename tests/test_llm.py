@@ -123,11 +123,31 @@ def test_choices_are_respected(monkeypatch):
     assert res.label == "needs_review"  # insufficient_funds not offered
 
 
-# --- write_message (provisional) ----------------------------------------- #
+# --- complete() -------------------------------------------------------- #
 
-def test_write_message_fake(monkeypatch):
+def test_complete_returns_empty_in_fake_mode(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "")
-    msg = llm.write_message(customer_name="Asha", amount_rupees=499,
-                            language="hinglish", ask="pay_link")
-    assert msg.model == "fake"
-    assert "Asha" in msg.text and "499" in msg.text
+    c = llm.complete("say hi")
+    assert c.text == "" and c.model == "fake" and c.cached is False
+
+
+def test_complete_caches(monkeypatch):
+    _use_gemini(monkeypatch)
+    calls = []
+
+    def fake_gemini(prompt, **kw):
+        calls.append(prompt)
+        return "generated body"
+
+    monkeypatch.setattr(llm, "_call_gemini", fake_gemini)
+    payload = {"k": 1}
+    a = llm.complete("p", cache_bucket="message", cache_payload=payload)
+    b = llm.complete("p", cache_bucket="message", cache_payload=payload)
+    assert a.text == "generated body" and a.cached is False
+    assert b.cached is True and len(calls) == 1
+
+
+def test_complete_swallows_errors(monkeypatch):
+    _use_gemini(monkeypatch)
+    monkeypatch.setattr(llm, "_call_gemini", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    assert llm.complete("p").text == ""

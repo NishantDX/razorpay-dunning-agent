@@ -216,6 +216,26 @@ structurally 0; the batch asserts it every run.
   persisted to disk, so re-running a batch cannot create a second charge.
 - **Tamper-evident audit log** — see step 9.
 
+### Message writer (`dunning/messaging.py`, step 8)
+
+The LLM's second and last job. `compose()` returns one `Message` per channel:
+
+* **sms** - ≤160 chars, plain, no emoji
+* **whatsapp** - 2-3 lines, conversational, one emoji
+
+in the customer's language (`en`, `hi` Devanagari, `hinglish` Latin script).
+
+Every candidate goes through `_validate()`: it must state the amount, carry the
+link when one was supplied, stay within the length cap, and must **not** contain
+threat / coercion words or a raw email / phone number. If it fails - or the
+provider is `fake` (no key) - a fixed per-channel/per-language template is used,
+and `Message.from_template` + `Message.issues` record why. So the pipeline always
+emits a safe message, and the audit log keeps the exact text sent on each
+channel.
+
+No tone A/B: with no real recipients there is nothing to optimise a lift
+against, so one polite, plain register is used everywhere.
+
 ## Where we deliberately did NOT use an LLM, and why
 
 The retry schedule, every limit and stopping rule, all money math, the "did it

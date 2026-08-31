@@ -150,5 +150,10 @@ docs/architecture.md the architecture doc
   the money a run may auto-charge and trips a circuit breaker on repeated gateway
   errors. An independent `assert_no_violations` recomputes from the finished logs
   — **0**, every run.
+- **Step 8** — `dunning/messaging.py`: the LLM's second job — the customer nudge,
+  written **per channel** (SMS terse, WhatsApp conversational) and per language
+  (en / hi / hinglish). A deterministic validator checks every message states
+  the amount, carries the link, and never threatens or leaks contact details;
+  anything that fails, or a run with no API key, falls back to a safe template.
 
-Next: the message writer (step 8).
+Next: the audit log (step 9).

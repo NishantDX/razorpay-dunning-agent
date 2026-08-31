@@ -5,8 +5,8 @@ Two narrow jobs, by design:
 * ``classify_failure()`` - a messy free-text failure reason -> one canonical root
   cause. The diagnoser (step 4) calls this only for text its rules table can't
   place; the clean ~85% never reach here.
-* ``write_message()`` - draft the customer nudge (step 8 owns this; a provisional
-  implementation lives here so the module is complete).
+* ``complete()`` - generic cached text generation, used by ``dunning.messaging``
+  to draft the customer nudge (step 8).
 
 Everything else in the agent stays deterministic code.
 
@@ -51,8 +51,8 @@ class ClassifyResult:
 
 
 @dataclass(frozen=True)
-class MessageResult:
-    text: str
+class Completion:
+    text: str            # "" when the provider is "fake" or the call failed
     model: str
     cached: bool
 
@@ -267,67 +267,29 @@ def classify_failure(text: str, choices: Sequence[str] = config.ROOT_CAUSES) -> 
 
 
 # --------------------------------------------------------------------------- #
-# write_message  (provisional - step 8 owns the real contract)
+# complete - generic cached text generation. dunning/messaging.py builds the
+# prompts and validates the output; here we only handle provider + cache.
+# In "fake" mode (no API key) this returns empty text and the caller falls back
+# to its own template, keeping the pipeline deterministic with zero setup.
 # --------------------------------------------------------------------------- #
 
-_MESSAGE_PROMPT = """Write a short, polite payment-recovery nudge to a customer.
-
-Constraints:
-- 2 sentences, under 40 words, no emojis.
-- Language: {language} (if "hinglish", mix natural Hindi + English in Latin script).
-- Mention the amount as Rs {amount_rupees}.
-- Ask them to {ask}. Do not threaten or blame.
-
-Return only the message text.
-"""
-
-_FAKE_MESSAGE = {
-    "en": "Hi {name}, your payment of Rs {amount_rupees} didn't go through. "
-          "Please {ask} so we can complete it.",
-    "hi": "Namaste {name}, aapka Rs {amount_rupees} ka payment nahi ho paaya. "
-          "Kripya {ask}.",
-    "hinglish": "Hi {name}, aapka Rs {amount_rupees} ka payment fail ho gaya. "
-                "Please {ask} taaki hum ise complete kar sakein.",
-}
-
-_ASK_TEXT = {
-    "retry": "let us try the charge again",
-    "update_method": "add a different card or payment method",
-    "pay_link": "use the payment link we sent",
-    "reauthorise_mandate": "re-approve the auto-pay mandate",
-}
-
-
-def write_message(*, customer_name: str, amount_rupees: int, language: str = "en",
-                  ask: str = "retry") -> MessageResult:
-    language = language if language in _FAKE_MESSAGE else "en"
-    ask_text = _ASK_TEXT.get(ask, ask)
-
+def complete(prompt: str, *, temperature: float = 0.3, cache_bucket: str = "complete",
+             cache_payload: dict = None) -> Completion:
     provider = active_provider()
     if provider == "fake":
-        text = _FAKE_MESSAGE[language].format(
-            name=customer_name, amount_rupees=amount_rupees, ask=ask_text
-        )
-        return MessageResult(text, "fake", False)
+        return Completion("", "fake", False)
 
     model = _model_label(provider)
-    payload = {"name": customer_name, "amount_rupees": amount_rupees,
-               "language": language, "ask": ask_text}
-    key = _key("write_message", model, payload)
+    key = _key(cache_bucket, model, cache_payload or {"prompt": prompt})
     hit = _cache().get(key)
     if hit:
-        return MessageResult(hit["result"]["text"], model, True)
+        return Completion(hit["result"]["text"], model, True)
 
-    prompt = _MESSAGE_PROMPT.format(language=language, amount_rupees=amount_rupees,
-                                    ask=ask_text)
     try:
-        text = _call_gemini(prompt, temperature=0.4)
+        text = _call_gemini(prompt, temperature=temperature)
     except Exception:
-        text = _FAKE_MESSAGE[language].format(
-            name=customer_name, amount_rupees=amount_rupees, ask=ask_text
-        )
-        return MessageResult(text, model, False)
+        return Completion("", model, False)
 
-    _cache_put(key, {"fn": "write_message", "model": model,
+    _cache_put(key, {"fn": cache_bucket, "model": model,
                      "result": {"text": text}, "ts": _now()})
-    return MessageResult(text, model, False)
+    return Completion(text, model, False)
