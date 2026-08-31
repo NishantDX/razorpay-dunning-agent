@@ -38,9 +38,14 @@ from pathlib import Path
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from dunning import config, diagnose, feed, llm, policy
+from dunning import config, diagnose, feed, llm, policy, redact
 
 G = config.GUARDRAILS
+M = config.MONEY
+
+
+def _amount_ok(paise: int) -> bool:
+    return M.min_single_action_paise <= int(paise) <= M.max_single_action_paise
 
 
 # --------------------------------------------------------------------------- #
@@ -76,15 +81,27 @@ class RazorpayGateway:
     """Thin wrapper over the Razorpay client. Owns idempotency: a repeated key
     returns the first response instead of creating a second object."""
 
-    def __init__(self, client, live: bool):
+    def __init__(self, client, live: bool, store_path=None):
         self._client = client
         self.live = live
+        self._store_path = Path(store_path) if store_path else None
         self._by_key: dict = {}
         self.calls: list = []      # (method, idempotency_key) - for audit / tests
+        if self._store_path and self._store_path.exists():
+            try:
+                self._by_key = json.loads(self._store_path.read_text("utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self._by_key = {}
 
     # -- internal --
     def _remember(self, key: str, resp: dict) -> dict:
         self._by_key[key] = resp
+        if self._store_path:  # survive across runs so a re-run cannot double-charge
+            try:
+                self._store_path.parent.mkdir(parents=True, exist_ok=True)
+                self._store_path.write_text(json.dumps(self._by_key), encoding="utf-8")
+            except OSError:
+                pass
         return resp
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=4),
@@ -135,12 +152,13 @@ class RazorpayGateway:
 
 
 def make_gateway() -> RazorpayGateway:
-    keys = config.RAZORPAY_KEY_ID and config.RAZORPAY_KEY_SECRET
-    if config.RAZORPAY_DRY_RUN or not keys:
+    # Fail safe: live calls need an explicit RAZORPAY_LIVE=1 plus both keys plus
+    # dry-run off. Anything else -> the local fake.
+    if not config.razorpay_is_live():
         return RazorpayGateway(None, live=False)
     import razorpay
     client = razorpay.Client(auth=(config.RAZORPAY_KEY_ID, config.RAZORPAY_KEY_SECRET))
-    return RazorpayGateway(client, live=True)
+    return RazorpayGateway(client, live=True, store_path=config.IDEMPOTENCY_STORE)
 
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +344,16 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
                                            "would breach its terms."))
             return finish("mandate_dead", False)
 
+        # --- money-safety rail: never act on an out-of-bounds amount ---
+        if step.action in config.RETRY_INTERVENTIONS or step.action in (
+                "switch_method", "send_payment_link", "send_mandate_link"):
+            if not _amount_ok(case["amount_paise"]):
+                attempts.append(Attempt(idx, step.action, scheduled_at, at,
+                                        outcome="blocked",
+                                        detail=f"amount {case['amount_paise']} paise outside "
+                                               f"safety limits - escalated."))
+                return finish("escalated_to_human", False)
+
         # --- retries ---
         if step.action in config.RETRY_INTERVENTIONS or step.action == "switch_method":
             if retries_used >= G.max_retries:
@@ -338,7 +366,8 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
                                              key)
             except Exception as exc:  # a live API failure must not crash the batch
                 attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="gateway_error",
-                                        idempotency_key=key, detail=f"{type(exc).__name__}: {exc}"))
+                                        idempotency_key=key,
+                                        detail=redact.sanitize(f"{type(exc).__name__}: {exc}")))
                 return finish("escalated_to_human", False)
             retries_used += 1
             ok = _recovered(case, step.action, clock, out_rng)
@@ -363,7 +392,8 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
                     idempotency_key=key)
             except Exception as exc:
                 attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="gateway_error",
-                                        idempotency_key=key, detail=f"{type(exc).__name__}: {exc}"))
+                                        idempotency_key=key,
+                                        detail=redact.sanitize(f"{type(exc).__name__}: {exc}")))
                 return finish("escalated_to_human", False)
             messages_sent += 1
             reply = _customer_reply(case, reply_rng)
@@ -492,11 +522,17 @@ def main(argv=None) -> None:
     gateway = make_gateway()
 
     results = []
+    quarantined = 0
     for event in events:
+        if not feed.verify_signature(event):      # reject unsigned / tampered events
+            quarantined += 1
+            continue
         case = cases_by_id[event["case_id"]]
         dx = diagnose.diagnose(event)
         a_plan = policy.plan(dx.root_cause, policy.context_from_case(case))
         results.append(execute_plan(case, a_plan, seed=args.seed, gateway=gateway))
+    if quarantined:
+        print(f"  WARNING: {quarantined} events failed signature verification (skipped)")
 
     if args.dump:
         with Path(args.dump).open("w", encoding="utf-8") as fh:

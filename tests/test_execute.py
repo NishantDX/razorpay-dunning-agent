@@ -68,9 +68,40 @@ def test_gateway_idempotency_blocks_double_charge():
     assert gw.calls.count(("create_order", "k1")) == 1
 
 
-def test_gateway_falls_back_to_fake_without_keys(monkeypatch):
-    monkeypatch.setattr(config, "RAZORPAY_DRY_RUN", True)
+def test_gateway_is_fake_unless_explicitly_live(monkeypatch):
+    # keys present but RAZORPAY_LIVE not set -> still the fake (fail safe)
+    monkeypatch.setattr(config, "RAZORPAY_KEY_ID", "rzp_test_x")
+    monkeypatch.setattr(config, "RAZORPAY_KEY_SECRET", "secret")
+    monkeypatch.setattr(config, "RAZORPAY_LIVE", False)
     assert execute.make_gateway().live is False
+    monkeypatch.setattr(config, "RAZORPAY_LIVE", True)
+    monkeypatch.setattr(config, "RAZORPAY_DRY_RUN", True)  # dry-run still wins
+    assert execute.make_gateway().live is False
+
+
+def test_out_of_bounds_amount_is_blocked(monkeypatch):
+    huge = execute.M.max_single_action_paise + 1
+    case = _case("bank_timeout", base_recovery_prob=1.0)
+    case["amount_paise"] = huge
+    r = _run(case)
+    assert r.stop_reason == "escalated_to_human"
+    assert any(a.outcome == "blocked" for a in r.attempts)
+    assert not r.recovered
+
+
+def test_gateway_error_detail_is_sanitized():
+    gw = execute.RazorpayGateway(None, live=True)
+
+    def boom(data):
+        raise RuntimeError("auth failed for rzp_test_ABCDEF123456 key=SECRETVALUE")
+
+    gw._live_order = boom
+    case = _case("bank_timeout", base_recovery_prob=1.0)
+    r = execute.execute_plan(case, policy.plan("bank_timeout", policy.context_from_case(case)),
+                             seed=1, gateway=gw)
+    err = [a for a in r.attempts if a.outcome == "gateway_error"][0]
+    assert "rzp_test_ABCDEF123456" not in err.detail
+    assert "SECRETVALUE" not in err.detail
 
 
 @pytest.mark.parametrize("day,dom,near", [

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 from collections import Counter
 from datetime import datetime
@@ -36,7 +37,33 @@ from pathlib import Path
 
 from dunning import config
 
-FEED_VERSION = 1
+FEED_VERSION = 2  # v2: events carry an HMAC signature
+
+
+# --------------------------------------------------------------------------- #
+# Webhook signatures
+#
+# A real Razorpay webhook arrives with an ``X-Razorpay-Signature`` header - an
+# HMAC-SHA256 of the raw body under a shared secret - and you MUST verify it
+# before trusting the payload. We replay from a file, so we sign each event when
+# building the feed and verify on the way in. Same discipline, no network.
+# --------------------------------------------------------------------------- #
+
+def _canonical(event: dict) -> bytes:
+    body = {k: v for k, v in event.items() if k != "x_signature"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sign_event(event: dict, secret: str = None) -> str:
+    secret = secret or config.WEBHOOK_SECRET
+    return hmac.new(secret.encode("utf-8"), _canonical(event), hashlib.sha256).hexdigest()
+
+
+def verify_signature(event: dict, secret: str = None) -> bool:
+    given = event.get("x_signature", "")
+    if not given:
+        return False
+    return hmac.compare_digest(given, sign_event(event, secret))
 
 # a stand-in for the merchant account id that real webhooks carry
 ACCOUNT_ID = "acc_SYNTH0000000000"
@@ -234,9 +261,11 @@ def build_event(case: dict) -> dict:
 
 
 def build_events(cases) -> list:
-    """All cases -> events, ordered by when the failure happened (then case_id)."""
+    """All cases -> signed events, ordered by when the failure happened."""
     events = [build_event(c) for c in cases]
     events.sort(key=lambda e: (e["created_at"], e["case_id"]))
+    for event in events:
+        event["x_signature"] = sign_event(event)
     return events
 
 

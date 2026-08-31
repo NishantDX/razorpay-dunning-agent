@@ -1,6 +1,7 @@
 """Tests for the step 3 event feed."""
 import json
 
+from dunning import config
 from dunning.feed import (
     EVENT_TYPES,
     build_event,
@@ -8,6 +9,8 @@ from dunning.feed import (
     load_events,
     main,
     replay,
+    sign_event,
+    verify_signature,
     write_events,
 )
 from dunning.generate import generate_cases
@@ -89,6 +92,34 @@ def test_latent_never_leaks_into_events():
 def test_deterministic():
     cases = _cases()
     assert build_events(cases) == build_events(cases)
+
+
+# --- webhook signatures ------------------------------------------------- #
+
+def test_every_event_is_signed_and_verifies():
+    for e in build_events(_cases(120)):
+        assert e.get("x_signature")
+        assert verify_signature(e) is True
+
+
+def test_tampered_event_fails_verification():
+    e = build_events(_cases(5))[0]
+    e["payload"]["payment"]["entity"]["amount"] = 999999
+    assert verify_signature(e) is False
+
+
+def test_unsigned_or_wrong_secret_fails():
+    e = build_events(_cases(5))[0]
+    assert verify_signature(e, secret="not-the-secret") is False
+    e.pop("x_signature")
+    assert verify_signature(e) is False
+
+
+def test_signature_uses_configured_secret(monkeypatch):
+    e = dict(build_events(_cases(3))[0])
+    e.pop("x_signature")
+    monkeypatch.setattr(config, "WEBHOOK_SECRET", "another-secret")
+    assert verify_signature({**e, "x_signature": sign_event(e)}) is True
 
 
 def test_replay_in_memory_matches_build():

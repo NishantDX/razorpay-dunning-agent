@@ -25,6 +25,9 @@ for _d in (DATA_DIR, REPORTS_DIR, LOGS_DIR):
 CASES_FILE = DATA_DIR / "cases.jsonl"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 AUDIT_LOG = LOGS_DIR / "audit.jsonl"
+AUDIT_MANIFEST = LOGS_DIR / "audit.manifest.json"
+IDEMPOTENCY_STORE = LOGS_DIR / "idempotency.json"
+REPORT_FILE = REPORTS_DIR / "latest.html"
 POLICY_FILE = ROOT / "config" / "policy.yaml"
 
 
@@ -39,10 +42,38 @@ GEMINI_MODEL = _get("GEMINI_MODEL", "gemini-2.0-flash")
 
 RAZORPAY_KEY_ID = _get("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = _get("RAZORPAY_KEY_SECRET")
+# Fail safe: real test-mode API calls happen ONLY when this is explicitly set.
+# Missing keys, or this unset, => the local fake. RAZORPAY_DRY_RUN=1 forces fake.
+RAZORPAY_LIVE = _get("RAZORPAY_LIVE", "0") == "1"
 RAZORPAY_DRY_RUN = _get("RAZORPAY_DRY_RUN", "0") == "1"
+
+# Secret used to HMAC-sign the replayed webhook feed and verify it on the way in.
+# A dev default so the pipeline demonstrates signature verification with no setup;
+# override in .env for anything real.
+WEBHOOK_SECRET = _get("WEBHOOK_SECRET", "dev-webhook-secret-not-for-production")
+# Secret that signs the audit run manifest (tamper-evidence on the chain head).
+AUDIT_SECRET = _get("AUDIT_SECRET", "dev-audit-secret-not-for-production")
 
 RANDOM_SEED = int(_get("RANDOM_SEED", "42") or "42")
 BATCH_SIZE = int(_get("BATCH_SIZE", "300") or "300")
+
+
+def razorpay_is_live() -> bool:
+    """Real Razorpay calls require an explicit opt-in AND both keys AND dry-run off."""
+    return RAZORPAY_LIVE and bool(RAZORPAY_KEY_ID) and bool(RAZORPAY_KEY_SECRET) \
+        and not RAZORPAY_DRY_RUN
+
+
+# --- Money safety rails (hard ceilings on what a run may attempt) --------- #
+@dataclass(frozen=True)
+class MoneyLimits:
+    max_single_action_paise: int = 100 * 100_000   # never act on a charge over Rs 1,00,000
+    min_single_action_paise: int = 100             # never act on Rs <1
+    max_total_attempted_paise: int = 100 * 5_000_00  # whole run may attempt <= Rs 25,00,000
+    max_gateway_errors: int = 15                   # circuit breaker: abort the run past this
+
+
+MONEY = MoneyLimits()
 
 
 # --- Guardrails: hard limits the agent may never exceed ---
