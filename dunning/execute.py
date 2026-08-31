@@ -38,7 +38,7 @@ from pathlib import Path
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from dunning import config, diagnose, feed, guardrails, messaging, policy, redact
+from dunning import audit, config, diagnose, feed, guardrails, messaging, policy, redact
 
 G = config.GUARDRAILS
 M = config.MONEY
@@ -505,6 +505,7 @@ def main(argv=None) -> None:
 
     results = []
     quarantined = 0
+    sink = audit.AuditSink().open(seed=args.seed)
     for event in events:
         if not feed.verify_signature(event):      # reject unsigned / tampered events
             quarantined += 1
@@ -515,12 +516,16 @@ def main(argv=None) -> None:
         case = cases_by_id[event["case_id"]]
         dx = diagnose.diagnose(event)
         a_plan = policy.plan(dx.root_cause, policy.context_from_case(case))
-        results.append(execute_plan(case, a_plan, seed=args.seed, gateway=gateway,
-                                    governor=governor))
+        r = execute_plan(case, a_plan, seed=args.seed, gateway=gateway, governor=governor)
+        results.append(r)
+        sink.record_case(case, dx, a_plan, r)
+    manifest = sink.close()
     if quarantined:
         print(f"  WARNING: {quarantined} events failed signature verification (skipped)")
 
     guardrails.assert_no_violations(results)  # independent check - must pass
+    print(f"  audit log            : {manifest['record_count']} records, "
+          f"chain head {manifest['chain_head'][:12]}...")
 
     if args.dump:
         with Path(args.dump).open("w", encoding="utf-8") as fh:

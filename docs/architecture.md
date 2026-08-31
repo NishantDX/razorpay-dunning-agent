@@ -214,7 +214,16 @@ structurally 0; the batch asserts it every run.
   checked before any gateway call.
 - **Idempotency that survives restarts** — in live mode the key→response map is
   persisted to disk, so re-running a batch cannot create a second charge.
-- **Tamper-evident audit log** — see step 9.
+- **Tamper-evident audit log** — `dunning/audit.py`. Every run writes
+  `logs/audit.jsonl`: one line per fact (`run_start`, then per case a
+  `diagnosis`, a `plan`, an `attempt` per attempt, a `case_summary`, then
+  `run_end`), each carrying `prev_hash` and its own `hash` (sha256 of the line
+  without its hash field). `logs/audit.manifest.json` pins the chain head, the
+  record count, a guardrail/policy config fingerprint, and an HMAC of all of it
+  under `AUDIT_SECRET`. `audit.verify()` (`make verify-audit`) recomputes the
+  chain and checks the manifest — any edit, drop, reorder, or a config change
+  since the run is caught. Customer data passes through `redact.redact_customer`
+  and free text through `redact.sanitize`, so no raw PII is stored.
 
 ### Message writer (`dunning/messaging.py`, step 8)
 

@@ -1,4 +1,4 @@
-.PHONY: setup generate feed diagnose policy execute run report test clean
+.PHONY: setup generate feed diagnose policy execute verify-audit run report test clean
 
 VENV=.venv
 PY=$(VENV)/bin/python
@@ -25,6 +25,9 @@ policy:
 
 execute:
 	$(PY) -m dunning.execute
+
+verify-audit:
+	$(PY) -m dunning.audit verify
 
 run:
 	$(PY) -m dunning.run_batch

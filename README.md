@@ -155,5 +155,11 @@ docs/architecture.md the architecture doc
   (en / hi / hinglish). A deterministic validator checks every message states
   the amount, carries the link, and never threatens or leaks contact details;
   anything that fails, or a run with no API key, falls back to a safe template.
+- **Step 9** — `dunning/audit.py`: every run writes `logs/audit.jsonl` — one
+  hash-chained line per fact (diagnosis, plan, each attempt, per-case summary),
+  PII masked on the way in. A signed `audit.manifest.json` pins the chain head,
+  the record count and a fingerprint of the guardrail/policy config.
+  `make verify-audit` recomputes the chain and checks the manifest; editing or
+  dropping any line is caught.
 
-Next: the audit log (step 9).
+Next: the batch runner + HTML report (step 10).
