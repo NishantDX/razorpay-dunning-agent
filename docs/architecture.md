@@ -170,6 +170,52 @@ the executor re-plans **once** to mandate repair and continues from the current
 clock time. This is step 12's deliberate failure, and it already works: retries
 stop, the mandate link is tried, then a human handoff - 0 rule violations.
 
+### Guardrail layer (`dunning/guardrails.py`, step 7)
+
+Every hard limit lives here and is applied identically to every case.
+
+`GuardrailLedger` (one per case). The executor calls `evaluate(action, when)`
+*before* each step and acts on the `Decision`:
+
+| kind | meaning | rules that produce it |
+|---|---|---|
+| `allow` | do it at the requested time | — |
+| `defer` | do it, but later | `retry_spacing` (≥24h since last retry), `contact_window` (09:00–20:00) |
+| `skip` | don't do this step, move on | `retry_cap` (3), `message_cap` (2) |
+| `halt` | stop the sequence, escalate | `action_hard_cap` (5) |
+
+Because the ledger decides *before* the action, a violation cannot happen. Every
+`Decision` is retained, so the audit log shows why each step ran when it did — or
+didn't. `record()` advances the counters only once the executor has actually
+performed the step (a re-plan's aborted step never counts).
+
+`SpendGovernor` (one per run). `may_attempt(paise)` gates auto-charges against a
+run-wide ceiling; `note_gateway_error()` feeds a circuit breaker that stops the
+batch launching new cases after `MONEY.max_gateway_errors`.
+
+`assert_no_violations(results)` — an independent recomputation from the finished
+attempt logs (counting only steps actually carried out). The ledger makes this
+structurally 0; the batch asserts it every run.
+
+### Security controls (cross-cutting)
+
+- **PII minimisation** — `dunning/redact.py` masks phone/email and keeps only a
+  first name; nothing with raw PII or a secret-shaped token reaches a log or the
+  report.
+- **Fail-safe gateway** — live Razorpay calls require `RAZORPAY_LIVE=1` *and*
+  both keys *and* dry-run off. Any other state uses the local fake.
+- **Webhook signatures** — every replayed event is HMAC-SHA256 signed
+  (`WEBHOOK_SECRET`) and verified on ingest; unsigned / tampered events are
+  quarantined.
+- **Prompt-injection resistance** — the classifier prompt fences the failure text
+  between markers, tells the model it is untrusted data, and never does anything
+  with the output but map it to the fixed enum (low confidence → `needs_review`).
+- **Money rails** — per-action amount band + a run-wide auto-charge ceiling,
+  checked before any gateway call.
+- **Idempotency that survives restarts** — in live mode the key→response map is
+  persisted to disk, so re-running a batch cannot create a second charge.
+- **Tamper-evident audit log** — see step 9.
+
 ## Where we deliberately did NOT use an LLM, and why
 
 The retry schedule, every limit and stopping rule, all money math, the "did it

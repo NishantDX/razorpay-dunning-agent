@@ -38,7 +38,7 @@ from pathlib import Path
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from dunning import config, diagnose, feed, llm, policy, redact
+from dunning import config, diagnose, feed, guardrails, llm, policy, redact
 
 G = config.GUARDRAILS
 M = config.MONEY
@@ -223,32 +223,7 @@ def _cause_shift(case: dict, actions_taken: int) -> str:
     return ""
 
 
-# --------------------------------------------------------------------------- #
-# Guardrail timing (minimal here; step 7 formalises violation tracking)
-# --------------------------------------------------------------------------- #
-
-def _in_contact_window(dt: datetime) -> bool:
-    return G.contact_window_start_hour <= dt.hour < G.contact_window_end_hour
-
-
-def _to_contact_window(dt: datetime) -> datetime:
-    if dt.hour < G.contact_window_start_hour:
-        return dt.replace(hour=G.contact_window_start_hour, minute=0, second=0, microsecond=0)
-    nxt = (dt + timedelta(days=1)).replace(
-        hour=G.contact_window_start_hour, minute=0, second=0, microsecond=0)
-    return nxt
-
-
-def _guarded_time(action: str, scheduled_at: datetime, attempts: list) -> datetime:
-    t = scheduled_at
-    if action in config.RETRY_INTERVENTIONS:
-        last = max((a.at for a in attempts if a.action in config.RETRY_INTERVENTIONS),
-                   default=None)
-        if last is not None:
-            t = max(t, last + timedelta(hours=G.min_hours_between_attempts))
-    if action in config.MESSAGE_INTERVENTIONS and not _in_contact_window(t):
-        t = _to_contact_window(t)
-    return t
+# All retry-spacing, contact-window and cap logic now lives in dunning.guardrails.
 
 
 # --------------------------------------------------------------------------- #
@@ -290,16 +265,18 @@ def _idem(case_id: str, index: int, action: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
-                 gateway: RazorpayGateway = None, clock: Clock = None) -> ExecutionResult:
+                 gateway: RazorpayGateway = None, clock: Clock = None,
+                 ledger: guardrails.GuardrailLedger = None,
+                 governor: guardrails.SpendGovernor = None) -> ExecutionResult:
     if seed is None:
         seed = config.RANDOM_SEED
     gateway = gateway or make_gateway()
     clock = clock or Clock(datetime.fromisoformat(case["failed_at"]))
+    ledger = ledger or guardrails.GuardrailLedger()
     out_rng = random.Random(f"{seed}:{case['case_id']}:outcome")
     reply_rng = random.Random(f"{seed}:{case['case_id']}:reply")
 
     attempts: list = []
-    retries_used = messages_sent = 0
     replanned = False
     current_cause = a_plan.root_cause
     replans_left = 1 if a_plan.replan_allowed else 0
@@ -307,138 +284,135 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
     def finish(stop_reason: str, recovered: bool) -> ExecutionResult:
         amt = case["amount_paise"] if recovered else 0
         return ExecutionResult(case["case_id"], current_cause, replanned, recovered, amt,
-                               stop_reason, retries_used, messages_sent, attempts, clock.now())
+                               stop_reason, ledger.retries_used, ledger.messages_sent,
+                               attempts, clock.now())
+
+    def add(action, scheduled_at, at, **kw):
+        attempts.append(Attempt(len(attempts), action, scheduled_at, at, **kw))
 
     timeline = deque(policy.schedule(a_plan, clock.now()))
 
     while timeline:
         step, scheduled_at = timeline.popleft()
 
-        if len(attempts) >= G.max_attempts_hard_cap:
-            attempts.append(Attempt(len(attempts), "handoff_human", scheduled_at, clock.now(),
-                                    outcome="escalated", detail="Hard action cap reached."))
-            return finish("escalated_to_human", False)
-
-        at = _guarded_time(step.action, scheduled_at, attempts)
-        clock.advance_to(at)
-        idx = len(attempts)
-        key = _idem(case["case_id"], idx, step.action)
-
         # --- the mandate died mid-sequence: re-plan once, or stop safely ---
-        if _cause_shift(case, len(attempts)) == "mandate_cancelled" \
+        if _cause_shift(case, ledger.actions_taken) == "mandate_cancelled" \
                 and current_cause != "mandate_cancelled":
             if replans_left and a_plan.replan_allowed:
                 replans_left -= 1
                 replanned = True
                 current_cause = "mandate_cancelled"
-                attempts.append(Attempt(idx, step.action, scheduled_at, clock.now(),
-                                        outcome="replanned",
-                                        detail="subscription.halted mid-sequence: mandate revoked "
-                                               "-> re-planned to mandate repair."))
+                add(step.action, scheduled_at, clock.now(), outcome="replanned",
+                    detail="subscription.halted mid-sequence: mandate revoked -> "
+                           "re-planned to mandate repair.")
                 a_plan = policy.plan("mandate_cancelled", policy.context_from_case(case))
                 timeline = deque(policy.schedule(a_plan, clock.now()))
                 continue
-            attempts.append(Attempt(idx, step.action, scheduled_at, clock.now(),
-                                    outcome="mandate_dead",
-                                    detail="Mandate revoked mid-sequence; going no further "
-                                           "would breach its terms."))
+            add(step.action, scheduled_at, clock.now(), outcome="mandate_dead",
+                detail="Mandate revoked mid-sequence; going no further would breach its terms.")
             return finish("mandate_dead", False)
 
-        # --- money-safety rail: never act on an out-of-bounds amount ---
+        # --- guardrail: allow / defer / skip / halt, all decided in one place ---
+        decision = ledger.evaluate(step.action, scheduled_at)
+        if decision.kind == "halt":
+            add(step.action, scheduled_at, clock.now(), outcome="escalated",
+                detail=f"{decision.rule}: {decision.note}")
+            return finish("escalated_to_human", False)
+        if decision.kind == "skip":
+            add(step.action, scheduled_at, scheduled_at, outcome="skipped",
+                detail=f"{decision.rule}: {decision.note}")
+            continue
+        at = decision.at
+        clock.advance_to(at)
+        key = _idem(case["case_id"], len(attempts), step.action)
+        defer_note = "" if decision.kind == "allow" else f"deferred by {decision.rule}"
+
+        # --- money-safety rails ---
         if step.action in config.RETRY_INTERVENTIONS or step.action in (
                 "switch_method", "send_payment_link", "send_mandate_link"):
             if not _amount_ok(case["amount_paise"]):
-                attempts.append(Attempt(idx, step.action, scheduled_at, at,
-                                        outcome="blocked",
-                                        detail=f"amount {case['amount_paise']} paise outside "
-                                               f"safety limits - escalated."))
+                add(step.action, scheduled_at, at, outcome="blocked",
+                    detail=f"amount {case['amount_paise']} paise outside safety limits.")
+                return finish("escalated_to_human", False)
+            # the run-wide ceiling governs auto-charges (retries), not links the
+            # customer must act on
+            if step.action in config.RETRY_INTERVENTIONS and governor is not None \
+                    and not governor.may_attempt(case["amount_paise"]):
+                add(step.action, scheduled_at, at, outcome="blocked",
+                    detail="run spend ceiling reached - escalated.")
                 return finish("escalated_to_human", False)
 
         # --- retries ---
         if step.action in config.RETRY_INTERVENTIONS or step.action == "switch_method":
-            if retries_used >= G.max_retries:
-                attempts.append(Attempt(idx, step.action, scheduled_at, at,
-                                        outcome="skipped", detail="Retry cap reached."))
-                continue
             try:
-                order = gateway.create_order(case["amount_paise"],
-                                             {"case_id": case["case_id"], "purpose": "dunning_retry"},
-                                             key)
+                order = gateway.create_order(
+                    case["amount_paise"],
+                    {"case_id": case["case_id"], "purpose": "dunning_retry"}, key)
             except Exception as exc:  # a live API failure must not crash the batch
-                attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="gateway_error",
-                                        idempotency_key=key,
-                                        detail=redact.sanitize(f"{type(exc).__name__}: {exc}")))
+                if governor is not None:
+                    governor.note_gateway_error()
+                add(step.action, scheduled_at, at, outcome="gateway_error", idempotency_key=key,
+                    detail=redact.sanitize(f"{type(exc).__name__}: {exc}"))
                 return finish("escalated_to_human", False)
-            retries_used += 1
+            ledger.record(step.action, at)
+            if governor is not None:
+                governor.note_attempt(case["amount_paise"])
             ok = _recovered(case, step.action, clock, out_rng)
-            attempts.append(Attempt(idx, step.action, scheduled_at, at,
-                                    outcome="recovered" if ok else "failed",
-                                    ref=order["id"], idempotency_key=key))
+            add(step.action, scheduled_at, at, outcome="recovered" if ok else "failed",
+                ref=order["id"], idempotency_key=key, detail=defer_note)
             if ok:
                 return finish("recovered", True)
             continue
 
         # --- messages that carry a link ---
         if step.action in ("send_payment_link", "send_mandate_link"):
-            if messages_sent >= G.max_messages_per_customer:
-                attempts.append(Attempt(idx, step.action, scheduled_at, at,
-                                        outcome="skipped", detail="Message cap reached."))
-                continue
             try:
                 link = gateway.create_payment_link(
                     case["amount_paise"], customer=case["customer"],
-                    description=("Re-authorise your subscription" if step.action == "send_mandate_link"
-                                 else "Complete your payment"),
+                    description=("Re-authorise your subscription"
+                                 if step.action == "send_mandate_link" else "Complete your payment"),
                     idempotency_key=key)
             except Exception as exc:
-                attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="gateway_error",
-                                        idempotency_key=key,
-                                        detail=redact.sanitize(f"{type(exc).__name__}: {exc}")))
+                if governor is not None:
+                    governor.note_gateway_error()
+                add(step.action, scheduled_at, at, outcome="gateway_error", idempotency_key=key,
+                    detail=redact.sanitize(f"{type(exc).__name__}: {exc}"))
                 return finish("escalated_to_human", False)
-            messages_sent += 1
+            ledger.record(step.action, at)
             reply = _customer_reply(case, reply_rng)
             if reply:
-                attempts.append(Attempt(idx, step.action, scheduled_at, at, ref=link["id"],
-                                        idempotency_key=key, outcome="customer_opted_out",
-                                        detail=f"customer replied {reply!r}"))
+                add(step.action, scheduled_at, at, ref=link["id"], idempotency_key=key,
+                    outcome="customer_opted_out", detail=f"customer replied {reply!r}")
                 return finish("customer_opted_out", False)
             ok = _recovered(case, step.action, clock, out_rng)
-            attempts.append(Attempt(idx, step.action, scheduled_at, at, ref=link["id"],
-                                    idempotency_key=key,
-                                    outcome="recovered" if ok else "sent"))
+            add(step.action, scheduled_at, at, ref=link["id"], idempotency_key=key,
+                outcome="recovered" if ok else "sent", detail=defer_note)
             if ok:
                 return finish("recovered", True)
             continue
 
         # --- reminder (message only) ---
         if step.action == "send_reminder":
-            if messages_sent >= G.max_messages_per_customer:
-                attempts.append(Attempt(idx, step.action, scheduled_at, at,
-                                        outcome="skipped", detail="Message cap reached."))
-                continue
             msg = llm.write_message(customer_name=case["customer"]["name"],
                                     amount_rupees=case["amount_rupees"],
                                     language=case["customer"]["language"], ask="retry")
-            messages_sent += 1
+            ledger.record(step.action, at)
             reply = _customer_reply(case, reply_rng)
             if reply:
-                attempts.append(Attempt(idx, step.action, scheduled_at, at,
-                                        outcome="customer_opted_out",
-                                        detail=f"customer replied {reply!r}"))
+                add(step.action, scheduled_at, at, outcome="customer_opted_out",
+                    detail=f"customer replied {reply!r}")
                 return finish("customer_opted_out", False)
-            attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="sent",
-                                    detail=msg.text[:90]))
+            add(step.action, scheduled_at, at, outcome="sent",
+                detail=redact.sanitize(msg.text[:90]))
             continue
 
         # --- terminal steps ---
         if step.action == "handoff_human":
-            attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="escalated",
-                                    detail=a_plan.rationale[:140]))
+            add(step.action, scheduled_at, at, outcome="escalated", detail=a_plan.rationale[:140])
             return finish("escalated_to_human", False)
 
         if step.action == "do_nothing":
-            attempts.append(Attempt(idx, step.action, scheduled_at, at, outcome="noop",
-                                    detail="Deliberately written off."))
+            add(step.action, scheduled_at, at, outcome="noop", detail="Deliberately written off.")
             return finish("written_off", False)
 
     return finish("max_retries_reached", False)
@@ -471,21 +445,7 @@ def result_to_dict(r: ExecutionResult) -> dict:
     }
 
 
-def _violations(results) -> int:
-    bad = 0
-    for r in results:
-        if r.retries_used > G.max_retries:
-            bad += 1
-        if r.messages_sent > G.max_messages_per_customer:
-            bad += 1
-        retry_times = [a.at for a in r.attempts if a.action in config.RETRY_INTERVENTIONS]
-        for earlier, later in zip(retry_times, retry_times[1:]):
-            if (later - earlier) < timedelta(hours=G.min_hours_between_attempts):
-                bad += 1
-        for a in r.attempts:
-            if a.action in config.MESSAGE_INTERVENTIONS and not _in_contact_window(a.at):
-                bad += 1
-    return bad
+_violations = guardrails.count_violations  # kept name for callers/tests
 
 
 def _print_summary(results, cases_by_id) -> None:
@@ -502,7 +462,7 @@ def _print_summary(results, cases_by_id) -> None:
           f"({got / at_risk:.1%})")
     print(f"  avg attempts / case  : {attempts_total / n:.2f}")
     print(f"  re-planned mid-run   : {sum(r.replanned for r in results)}")
-    print(f"  guardrail violations : {_violations(results)}")
+    print(f"  guardrail violations : {guardrails.count_violations(results)}")
     print("\n  stop reason:")
     for k, v in stops.most_common():
         print(f"    {k:<22} {v:>4}  ({v / n:.0%})")
@@ -520,6 +480,7 @@ def main(argv=None) -> None:
     events = feed.load_events(args.events)
     cases_by_id = {c["case_id"]: c for c in feed.load_cases(args.cases)}
     gateway = make_gateway()
+    governor = guardrails.SpendGovernor()
 
     results = []
     quarantined = 0
@@ -527,12 +488,18 @@ def main(argv=None) -> None:
         if not feed.verify_signature(event):      # reject unsigned / tampered events
             quarantined += 1
             continue
+        if governor.tripped():
+            print(f"  HALTED: {governor.tripped()} - stopped launching new cases")
+            break
         case = cases_by_id[event["case_id"]]
         dx = diagnose.diagnose(event)
         a_plan = policy.plan(dx.root_cause, policy.context_from_case(case))
-        results.append(execute_plan(case, a_plan, seed=args.seed, gateway=gateway))
+        results.append(execute_plan(case, a_plan, seed=args.seed, gateway=gateway,
+                                    governor=governor))
     if quarantined:
         print(f"  WARNING: {quarantined} events failed signature verification (skipped)")
+
+    guardrails.assert_no_violations(results)  # independent check - must pass
 
     if args.dump:
         with Path(args.dump).open("w", encoding="utf-8") as fh:

@@ -136,13 +136,19 @@ docs/architecture.md the architecture doc
 - **Step 6** — `make execute`: walks each plan against **real Razorpay
   test-mode APIs** (`retry_*` creates a fresh Order, `send_*_link` creates a
   Payment Link), every create carrying an idempotency key the gateway dedupes on
-  so a step can't double-charge. A virtual clock is fast-forwarded between
-  steps; the ≥24h retry spacing and the 09:00–20:00 contact window are enforced.
+  so a step can't double-charge. A virtual clock is fast-forwarded between steps.
   The *outcome* of an attempt (did the customer actually pay) is the one
-  simulated part — rolled from the case's hidden `latent` with a seeded RNG,
-  since test mode has no real payer. If a subscription's mandate dies
-  mid-sequence, the executor re-plans once to mandate repair and stops retrying.
-  With no keys / `RAZORPAY_DRY_RUN=1` a local fake stands in. Offline batch:
-  ~58% recovered, ~55% of value, **0 guardrail violations**.
+  simulated part — rolled from the case's hidden `latent` with a seeded RNG.
+- **Security pass** — PII masked everywhere it's logged; real Razorpay calls need
+  an explicit `RAZORPAY_LIVE=1`; every replayed webhook is HMAC-signed and
+  verified on the way in; the LLM prompt fences the failure text as untrusted
+  data; out-of-bounds amounts are blocked before any API call; the idempotency
+  map persists to disk so a re-run can't double-charge.
+- **Step 7** — `dunning/guardrails.py`: one `GuardrailLedger` per case answers
+  *allow / defer / skip / halt* before every step, so a breach is structurally
+  impossible; every decision is kept for the audit log. A `SpendGovernor` caps
+  the money a run may auto-charge and trips a circuit breaker on repeated gateway
+  errors. An independent `assert_no_violations` recomputes from the finished logs
+  — **0**, every run.
 
-Next: the guardrail layer (step 7) — formalise the caps + violation tracking.
+Next: the message writer (step 8).

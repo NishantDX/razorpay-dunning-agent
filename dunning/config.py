@@ -67,10 +67,10 @@ def razorpay_is_live() -> bool:
 # --- Money safety rails (hard ceilings on what a run may attempt) --------- #
 @dataclass(frozen=True)
 class MoneyLimits:
-    max_single_action_paise: int = 100 * 100_000   # never act on a charge over Rs 1,00,000
-    min_single_action_paise: int = 100             # never act on Rs <1
-    max_total_attempted_paise: int = 100 * 5_000_00  # whole run may attempt <= Rs 25,00,000
-    max_gateway_errors: int = 15                   # circuit breaker: abort the run past this
+    max_single_action_paise: int = 1_00_000 * 100      # never act on a charge over Rs 1,00,000
+    min_single_action_paise: int = 100                 # never act on Rs <1
+    max_total_attempted_paise: int = 2_00_00_000 * 100  # a run may auto-charge <= Rs 2 crore total
+    max_gateway_errors: int = 15                       # circuit breaker: abort the run past this
 
 
 MONEY = MoneyLimits()
