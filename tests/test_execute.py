@@ -188,6 +188,25 @@ def test_mandate_revoke_triggers_one_replan():
     assert not any(a.action in config.RETRY_INTERVENTIONS for a in r.attempts)
 
 
+def test_status_check_prevents_a_double_charge():
+    # customer pays out of band before the agent's 2nd action (a retry)
+    case = _case("insufficient_funds", paid_out_of_band_at_action=2, base_recovery_prob=0.0)
+    r = _run(case)
+    assert r.recovered and r.double_charge_prevented is True
+    assert r.retries_used == 0                       # no charge was ever created
+    assert "double charge prevented" in r.attempts[-1].detail
+    assert r.amount_recovered_paise == case["amount_paise"]
+
+
+def test_status_check_fires_on_the_planted_action_only():
+    # transient plan: retry_now (action 1), retry_later (action 2), handoff.
+    # planted at 2 -> first retry runs, second is short-circuited by the check.
+    case = _case("bank_timeout", paid_out_of_band_at_action=2, base_recovery_prob=0.0,
+                 transient_retry_prob=0.0)
+    r = _run(case)
+    assert r.double_charge_prevented and r.retries_used == 1
+
+
 def test_mandate_revoke_stops_safely_when_replan_disabled():
     case = _case("bank_timeout", kind="subscription", mandate_revokes_at_attempt=2)
     r = _run(case, replan_allowed=False)

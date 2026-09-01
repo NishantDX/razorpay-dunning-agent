@@ -161,7 +161,9 @@ class AuditSink:
             "recovered": result.recovered,
             "amount_recovered_paise": result.amount_recovered_paise,
             "stop_reason": result.stop_reason, "retries_used": result.retries_used,
-            "messages_sent": result.messages_sent, "replanned": result.replanned})
+            "messages_sent": result.messages_sent, "replanned": result.replanned,
+            "double_charge_prevented": result.double_charge_prevented,
+            "showcase": case["latent"].get("showcase")})
 
 
 # --------------------------------------------------------------------------- #

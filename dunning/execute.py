@@ -226,6 +226,14 @@ def _cause_shift(case: dict, actions_taken: int) -> str:
     return ""
 
 
+def _already_paid(case: dict, actions_taken: int) -> bool:
+    """A status check the agent runs BEFORE every charge / link create. In live
+    mode this is client.order.fetch / client.payment.all; here it consults the
+    simulator, which only returns True for a planted out-of-band payment."""
+    at = case["latent"].get("paid_out_of_band_at_action")
+    return at is not None and actions_taken + 1 == at
+
+
 # All retry-spacing, contact-window and cap logic now lives in dunning.guardrails.
 
 
@@ -265,6 +273,7 @@ class ExecutionResult:
     messages_sent: int
     attempts: list = field(default_factory=list)
     finished_at: datetime = None
+    double_charge_prevented: bool = False
 
 
 def _idem(case_id: str, index: int, action: str) -> str:
@@ -301,6 +310,7 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
 
     attempts: list = []
     replanned = False
+    dcp = False
     current_cause = a_plan.root_cause
     replans_left = 1 if a_plan.replan_allowed else 0
 
@@ -308,7 +318,7 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
         amt = case["amount_paise"] if recovered else 0
         return ExecutionResult(case["case_id"], current_cause, replanned, recovered, amt,
                                stop_reason, ledger.retries_used, ledger.messages_sent,
-                               attempts, clock.now())
+                               attempts, clock.now(), dcp)
 
     def add(action, scheduled_at, at, **kw):
         attempts.append(Attempt(len(attempts), action, scheduled_at, at, **kw))
@@ -349,6 +359,16 @@ def execute_plan(case: dict, a_plan: policy.Plan, *, seed: int = None,
         clock.advance_to(at)
         key = _idem(case["case_id"], len(attempts), step.action)
         defer_note = "" if decision.kind == "allow" else f"deferred by {decision.rule}"
+
+        # --- status check before any charge / link: is it already paid? ---
+        if step.action in config.RETRY_INTERVENTIONS or step.action in (
+                "switch_method", "send_payment_link", "send_mandate_link"):
+            if _already_paid(case, ledger.actions_taken):
+                dcp = True
+                add(step.action, scheduled_at, at, outcome="recovered",
+                    detail="status check found the payment already completed out of band "
+                           "- no new charge created (double charge prevented).")
+                return finish("recovered", True)
 
         # --- money-safety rails ---
         if step.action in config.RETRY_INTERVENTIONS or step.action in (
@@ -458,6 +478,7 @@ def result_to_dict(r: ExecutionResult) -> dict:
         "recovered": r.recovered, "amount_recovered_paise": r.amount_recovered_paise,
         "stop_reason": r.stop_reason, "retries_used": r.retries_used,
         "messages_sent": r.messages_sent,
+        "double_charge_prevented": r.double_charge_prevented,
         "finished_at": r.finished_at.isoformat() if r.finished_at else None,
         "attempts": [
             {"index": a.index, "action": a.action, "outcome": a.outcome,

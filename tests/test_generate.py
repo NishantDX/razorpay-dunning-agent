@@ -98,7 +98,7 @@ def test_insufficient_funds_has_salary_day_and_timing_bonus():
     assert inf
     for c in inf:
         assert 1 <= c["latent"]["funds_return_day"] <= 31
-        if not c["latent"]["chronic"]:
+        if not c["latent"]["chronic"] and not c["latent"]["showcase"]:
             assert c["latent"]["timing_bonus_prob"] > c["latent"]["base_recovery_prob"]
 
 
@@ -106,6 +106,28 @@ def test_messy_reason_fraction_in_range():
     cases = generate_cases(400, seed=42)
     frac = sum(c["reason_is_messy"] for c in cases) / len(cases)
     assert 0.08 <= frac <= 0.24
+
+
+def test_both_showcases_are_guaranteed_and_tagged():
+    tags = {c["latent"]["showcase"] for c in generate_cases(300, seed=42)
+            if c["latent"]["showcase"]}
+    assert "mandate_revoked_midway" in tags
+    assert "double_charge_prevented" in tags
+    # every tagged case carries the trigger the tag names
+    for c in generate_cases(300, seed=42):
+        t = c["latent"]["showcase"]
+        if t == "mandate_revoked_midway":
+            assert c["latent"]["mandate_revokes_at_attempt"] is not None
+        if t == "double_charge_prevented":
+            assert c["latent"]["paid_out_of_band_at_action"] is not None
+
+
+def test_showcases_planted_when_a_small_batch_produces_none():
+    from dunning.generate import _ensure_showcases, _build_case, REFERENCE_NOW
+    cases = [_build_case(i, 1, REFERENCE_NOW) for i in range(12)]
+    _ensure_showcases(cases)
+    tags = {c["latent"]["showcase"] for c in cases if c["latent"]["showcase"]}
+    assert {"mandate_revoked_midway", "double_charge_prevented"} <= tags
 
 
 def test_mandate_revokes_midway_subset():

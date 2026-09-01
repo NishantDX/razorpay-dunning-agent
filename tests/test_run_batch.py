@@ -44,6 +44,21 @@ def test_agent_beats_the_naive_baseline(rr):
     assert agent > naive
 
 
+def test_both_deliberate_failures_are_showcased(rr):
+    sc = rr.showcases()
+    assert set(sc) == {"mandate_revoked_midway", "double_charge_prevented"}
+    _cid, mandate_r = sc["mandate_revoked_midway"]
+    assert mandate_r.replanned or mandate_r.stop_reason == "mandate_dead"
+    _cid, dc_r = sc["double_charge_prevented"]
+    assert dc_r.double_charge_prevented is True
+    assert rr.double_charges_prevented() >= 1
+
+
+def test_baseline_rule_break_estimate_is_reported(rr):
+    b = rr.baseline_summary("blind_three")
+    assert b["rule_breaks"] > b["recovered"]     # 3 blind retries -> lots of gap breaches
+
+
 # --- report ---------------------------------------------------------- #
 
 def test_report_context_is_sane(rr):

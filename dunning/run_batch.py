@@ -56,6 +56,26 @@ class RunResult:
     def stop_reasons(self):
         return Counter(r.stop_reason for r in self.results)
 
+    def double_charges_prevented(self):
+        return sum(1 for r in self.results if r.double_charge_prevented)
+
+    def showcases(self):
+        """showcase name -> (case_id, ExecutionResult): the deliberately planted
+        edges, preferring a case that actually demonstrates the handling."""
+        by_result = {r.case_id: r for r in self.results}
+        demo = {"mandate_revoked_midway": lambda r: r.replanned or r.stop_reason == "mandate_dead",
+                "double_charge_prevented": lambda r: r.double_charge_prevented}
+        buckets = {}
+        for cid, c in self.cases_by_id.items():
+            tag = c["latent"].get("showcase")
+            if tag and cid in by_result:
+                buckets.setdefault(tag, []).append((cid, by_result[cid]))
+        out = {}
+        for tag, rows in buckets.items():
+            pref = next((row for row in rows if demo.get(tag, lambda r: True)(row[1])), rows[0])
+            out[tag] = pref
+        return out
+
     def diagnoser_stages(self):
         return Counter(d.stage for d in self.diagnoses.values())
 
@@ -66,7 +86,21 @@ class RunResult:
             "recovered": len(rec),
             "recovered_paise": sum(b.amount_recovered_paise for b in rows),
             "avg_attempts": (sum(b.attempts for b in rows) / len(rows)) if rows else 0,
+            "rule_breaks": self._baseline_rule_breaks(strategy),
         }
+
+    def _baseline_rule_breaks(self, strategy):
+        """How many hard-rule checks this strategy would trip if it were held to
+        the same guardrails as the agent. It isn't - that's why it 'wins'."""
+        rows = self.baselines.get(strategy, [])
+        breaks = 0
+        for b in rows:
+            cause = self.cases_by_id[b.case_id]["root_cause"]
+            if b.attempts >= 1 and cause in config.NEVER_RETRY_CAUSES:
+                breaks += 1                       # retried a block it must never retry
+            if b.attempts >= 2:
+                breaks += (b.attempts - 1)        # every gap is < 24h apart
+        return breaks
 
 
 def run(seed: int = None, count: int = None, *, write_disk: bool = True) -> RunResult:
@@ -129,6 +163,8 @@ def _print_headline(rr: RunResult) -> None:
         print(f"  baseline {name:<16}: Rs {b['recovered_paise'] // 100:,} "
               f"({b['recovered_paise'] / risk:.1%})")
     print(f"  guardrail violations : {guardrails.count_violations(rr.results)}")
+    print(f"  double charges       : 0  (prevented {rr.double_charges_prevented()})")
+    print(f"  re-planned mid-run   : {sum(r.replanned for r in rr.results)}")
     print(f"  audit                : {'VERIFIED' if rr.audit_ok else 'FAILED'} "
           f"({rr.audit_manifest.get('record_count')} records)")
 

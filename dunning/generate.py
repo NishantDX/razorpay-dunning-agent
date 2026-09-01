@@ -91,6 +91,8 @@ MESSY_REASON_RATE = 0.15
 # fraction of recoverable-looking subscription cases where the mandate is
 # revoked partway through the sequence (step 12's deliberate failure).
 MANDATE_REVOKE_RATE = 0.20
+# fraction of retry-safe cases where the customer pays out of band mid-sequence
+OUT_OF_BAND_PAY_RATE = 0.05
 
 LANGUAGE_WEIGHTS = {"en": 0.45, "hinglish": 0.40, "hi": 0.15}
 REACHABLE_RATE = 0.85
@@ -379,6 +381,10 @@ def _build_latent(rng: random.Random, root_cause: str, kind: str) -> dict:
         "opt_out_prob": 0.02,             # customer replies stop / unsubscribe on a msg
         "chronic": False,                 # unrecoverable no matter what the agent does
         "mandate_revokes_at_attempt": None,  # mandate dies mid-sequence at this attempt
+        "paid_out_of_band_at_action": None,  # customer pays independently before the
+                                             # agent's Nth action - a status check must
+                                             # catch it so no second charge is created
+        "showcase": None,                 # tags a deliberately-planted edge case
     }
 
     if root_cause == "insufficient_funds":
@@ -482,6 +488,16 @@ def _build_latent(rng: random.Random, root_cause: str, kind: str) -> dict:
     ):
         latent["mandate_revokes_at_attempt"] = rng.choice([1, 2, 2])
 
+    # the customer pays out of band (their own bank app / an earlier link) while a
+    # retry is still scheduled - the agent must status-check before charging again.
+    if (
+        root_cause in config.RETRY_SAFE_CAUSES
+        and not latent["chronic"]
+        and latent["mandate_revokes_at_attempt"] is None
+        and rng.random() < OUT_OF_BAND_PAY_RATE
+    ):
+        latent["paid_out_of_band_at_action"] = rng.choice([2, 2, 3])
+
     return latent
 
 
@@ -531,12 +547,52 @@ def _build_case(index: int, seed: int, reference_now: datetime) -> dict:
     }
 
 
+def _ensure_showcases(cases: list) -> None:
+    """Designate exactly one case per deliberately-handled edge and force its
+    latent so the handling is *demonstrated* in every batch, whatever the seed.
+    Picks a naturally-occurring candidate where possible, else the first fit.
+    Mutates in place."""
+
+    def _quiet(latent):  # so the trigger is actually reached, not pre-empted
+        latent["base_recovery_prob"] = 0.0
+        latent["timing_bonus_prob"] = 0.0
+        latent["transient_retry_prob"] = 0.0
+        latent["chronic"] = False
+
+    # 1. mandate revoked mid-sequence
+    pick = next((c for c in cases if c["latent"]["mandate_revokes_at_attempt"] is not None
+                 and not c["latent"]["showcase"]), None)
+    pick = pick or next((c for c in cases if c["kind"] == "subscription"
+                         and c["root_cause"] in config.RETRY_SAFE_CAUSES
+                         and not c["latent"]["showcase"]), None)
+    if pick:
+        _quiet(pick["latent"])
+        pick["latent"]["mandate_revokes_at_attempt"] = 2
+        pick["latent"]["paid_out_of_band_at_action"] = None
+        pick["latent"]["showcase"] = "mandate_revoked_midway"
+
+    # 2. customer pays out of band while a retry is pending
+    pick = next((c for c in cases if c["latent"]["paid_out_of_band_at_action"] is not None
+                 and not c["latent"]["showcase"]), None)
+    pick = pick or next((c for c in cases if c["kind"] == "payment"
+                         and c["root_cause"] in config.RETRY_SAFE_CAUSES
+                         and c["customer"]["reachable"] and not c["latent"]["showcase"]), None)
+    if pick:
+        _quiet(pick["latent"])
+        pick["latent"]["mandate_revokes_at_attempt"] = None
+        pick["latent"]["paid_out_of_band_at_action"] = 2
+        pick["latent"]["showcase"] = "double_charge_prevented"
+
+
 def generate_cases(count: int, seed: int = None, reference_now: datetime = REFERENCE_NOW):
-    """Return a list of ``count`` case dicts. Deterministic in (count is only the
-    range; each case depends on ``seed`` and its own id)."""
+    """Return a list of ``count`` case dicts. Deterministic (count is only the
+    range; each case depends on ``seed`` and its own id). At least one instance of
+    each deliberately-handled edge case is guaranteed and tagged in ``latent.showcase``."""
     if seed is None:
         seed = config.RANDOM_SEED
-    return [_build_case(i, seed, reference_now) for i in range(count)]
+    cases = [_build_case(i, seed, reference_now) for i in range(count)]
+    _ensure_showcases(cases)
+    return cases
 
 
 def write_cases(cases, path: Path) -> None:

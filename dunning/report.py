@@ -61,7 +61,7 @@ def build_context(rr) -> dict:
             "pct": b["recovered_paise"] / risk if risk else 0,
             "avg_attempts": b["avg_attempts"],
             "compliant": False,
-            "note": _base_notes.get(name, ""),
+            "note": _base_notes.get(name, "") + f" &mdash; would trip ~{b['rule_breaks']} guardrail checks",
             "is_agent": False,
         })
     strategies.append({
@@ -96,8 +96,27 @@ def build_context(rr) -> dict:
                       for a in r.attempts],
         })
 
+    _SHOWCASE_TITLE = {
+        "mandate_revoked_midway": "Subscription mandate cancelled mid-sequence",
+        "double_charge_prevented": "Customer paid out of band while a retry was pending",
+    }
+    showcases = []
+    for tag, (cid, r) in rr.showcases().items():
+        showcases.append({
+            "title": _SHOWCASE_TITLE.get(tag, tag),
+            "case_id": cid,
+            "outcome": ("re-planned to mandate repair, retries stopped, escalated"
+                        if tag == "mandate_revoked_midway"
+                        else "status check caught it, no second charge created"),
+            "ended": r.stop_reason,
+            "steps": [{"action": a.action, "outcome": a.outcome, "detail": a.detail[:120]}
+                      for a in r.attempts],
+        })
+
     m = rr.audit_manifest
     return {
+        "showcases": showcases,
+        "double_charges_prevented": rr.double_charges_prevented(),
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "version": __version__,
         "seed": rr.seed,
@@ -231,7 +250,8 @@ _TEMPLATE = Template("""<!doctype html>
   <h2>Bounds &amp; safety</h2>
   <div class="tiles">
     <div class="tile ok"><div class="n">{{ violations }}</div><div class="l">guardrail violations</div></div>
-    <div class="tile ok"><div class="n">{{ double_charges }}</div><div class="l">double charges</div></div>
+    <div class="tile ok"><div class="n">{{ double_charges }}</div>
+      <div class="l">double charges ({{ double_charges_prevented }} prevented by a status check)</div></div>
     <div class="tile"><div class="n">{{ escalated }}</div><div class="l">escalated to a human</div></div>
     <div class="tile"><div class="n">{{ written_off }}</div><div class="l">written off (low value)</div></div>
     <div class="tile"><div class="n">{{ replanned }}</div><div class="l">re-planned mid-run</div></div>
@@ -261,6 +281,22 @@ _TEMPLATE = Template("""<!doctype html>
     free text its rules table could not place. Everything else (schedule, every limit
     and stopping rule, money math, the &ldquo;did it arrive?&rdquo; check, the audit log)
     is plain deterministic code.</p>
+
+  <h2>Deliberate failures, handled</h2>
+  <div class="ex">
+    {% for sc in showcases %}
+    <div class="card">
+      <div style="font-weight:600">{{ sc.title }}</div>
+      <div class="sub" style="margin:8px 0 10px">{{ sc.case_id }} &middot; ended {{ sc.ended }}</div>
+      <ul class="steps">
+        {% for st in sc.steps %}
+        <li class="{{ st.outcome }}"><span class="a">{{ st.action }}</span> &mdash; {{ st.outcome }}
+          {% if st.detail %}<div class="d">{{ st.detail }}</div>{% endif %}</li>
+        {% endfor %}
+      </ul>
+      <div class="sub" style="margin-top:8px">&rarr; {{ sc.outcome }}</div>
+    </div>{% endfor %}
+  </div>
 
   <h2>Example case timelines</h2>
   <div class="ex">
