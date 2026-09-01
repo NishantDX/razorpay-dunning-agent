@@ -1,7 +1,5 @@
 # Architecture
 
-> Draft. Filled in as the build progresses (step 13).
-
 ## The recovery loop (5 steps)
 
 1. **Detect** - consume a stream of at-risk events (failed one-time payments, halted subscriptions).
@@ -11,12 +9,42 @@
    arrived, obey hard caps and stopping rules, log every step.
 5. **Measure** - over the whole batch: rupees recovered, % recovered, avg attempts,
    count escalated, rule violations (target 0), double charges (target 0). Broken down
-   by root cause, compared against a naive baseline.
+   by root cause, compared against naive baselines.
 
 ## Components
 
-_TODO: diagram + one line per component (generator, feed, diagnoser, policy engine,
-executor, guardrails, message writer, audit log, batch runner)._
+```
+                 config/policy.yaml      dunning/config.py
+                  (cause -> steps)   (limits, vocab, secrets, paths)
+                         |                     |
+generate.py --> feed.py --> [ diagnose.py --> policy.py --> execute.py ] --> audit.py
+ cases.jsonl   events.jsonl    |         |          |           |            audit.jsonl
+ (+ latent,   (HMAC-signed     |    Diagnosis    Plan     Clock + RazorpayGateway   + manifest
+  showcase)    webhooks)       |                          + GuardrailLedger          (hash chain)
+                               |                          + SpendGovernor
+                          llm.py (Gemini,               guardrails.py
+                          classify only)              messaging.py (per-channel nudge)
+                               |
+                       run_batch.py  ---- baseline.py (naive_one_retry, blind_three)
+                               |
+                          report.py  -->  reports/latest.html
+```
+
+| component | file | role |
+|---|---|---|
+| generator | `generate.py` | ~300 synthetic at-risk cases with a hidden `latent` recovery model; plants + tags the showcase edge cases |
+| event feed | `feed.py` | each case → an HMAC-signed, Razorpay-webhook-shaped event, time-ordered; `verify_signature` on ingest |
+| diagnoser | `diagnose.py` | event → one of 15 root causes via a cheapest-first cascade; LLM only for messy free text |
+| LLM wrapper | `llm.py` | the one place Gemini is called: `classify_failure` + generic `complete`; provider select, response cache, offline fallback |
+| policy engine | `policy.py` + `config/policy.yaml` | root cause + context → a fixed, bounded `Plan` (interventions + schedule) |
+| executor | `execute.py` | walks a plan against real Razorpay test APIs; virtual `Clock`; `RazorpayGateway` (idempotent); rolls `latent` for the pay/no-pay outcome; one re-plan on a cause shift; status check before every charge |
+| guardrails | `guardrails.py` | `GuardrailLedger` (allow/defer/skip/halt per step), `SpendGovernor` (run ceiling + circuit breaker), independent violation recompute |
+| message writer | `messaging.py` | per-channel (SMS / WhatsApp), per-language customer nudge; deterministic safety validator + template fallback |
+| redaction | `redact.py` | mask phone/email, first name only, strip secret-shaped tokens - applied to everything logged |
+| audit log | `audit.py` | append-only hash-chained `logs/audit.jsonl` + signed manifest; `verify()` / `make verify-audit` |
+| batch runner | `run_batch.py` | the whole pipeline in one call + the baselines; produces a `RunResult` |
+| report | `report.py` | one self-contained `reports/latest.html` |
+| baselines | `baseline.py` | naive strategies sharing the executor's outcome oracle and seed |
 
 ### Synthetic data (`dunning/generate.py`, step 2)
 
@@ -256,12 +284,25 @@ of genuinely messy free text, and even then it only *labels*: it never chooses
 an action, a schedule, or an amount. The other LLM use is writing the customer
 nudge message (step 8), where natural phrasing is the point.
 
-## Guardrails
+## Guardrails, in one place
 
-_TODO: pull from `dunning/config.py` - max 3 retries, >=24h apart, contact only
-09:00-20:00, <=2 messages/customer, absolute cap of 5 actions. Stopping rules: money
-recovered, customer reply (paid / stop / dispute / unsubscribe), dead mandate,
-max retries, human escalation._
+All defined in `dunning/config.py`:
+
+| limit | value | enforced by |
+|---|---|---|
+| retries per case | ≤ 3 | `GuardrailLedger` → `skip` |
+| gap between retries | ≥ 24 h | `GuardrailLedger` → `defer` |
+| contact window | 09:00–20:00 local | `GuardrailLedger` → `defer` |
+| messages per customer | ≤ 2 | `GuardrailLedger` → `skip` |
+| actions per case (any kind) | ≤ 5 | `GuardrailLedger` → `halt` |
+| single auto-charge | ₹1 – ₹1,00,000 | `execute._amount_ok` → block + escalate |
+| auto-charge per run | ≤ ₹2 crore | `SpendGovernor.may_attempt` |
+| gateway errors per run | ≤ 15 then abort | `SpendGovernor.tripped` |
+
+**Stopping rules** (the sequence ends immediately): money recovered; customer
+reply matches `stop` / `unsubscribe` / `dispute`; subscription mandate found
+dead; retries or the action cap exhausted; escalation to a human; deliberate
+write-off. Each result carries one `config.STOP_REASONS` value.
 
 ### Batch runner + report (`dunning/run_batch.py`, `dunning/report.py`, step 10)
 
@@ -298,4 +339,39 @@ CSS, no JS, no CDN). Single seed; deterministic; the seed is on the report.
 
 ## What broke, and how I got out
 
-_TODO: dev journal - the real bug hit while building + the fix._
+Four bugs worth keeping. All were caught by tests or by diffing the headline
+number before/after a change - none by staring at the code.
+
+**1. The rules table was *too good*, so the LLM never ran.**
+The first messy-reason pool leaned on phrases like "expired card" and "e-mandate"
+that the literal text rules matched anyway, so the LLM fallback classified ~0
+cases and there was nothing to demonstrate. Fix: split the messy pool in two -
+half carry a literal token the rules still catch, half have only semantic signal
+("the paycheck is late this month") and fall through to the LLM. The diagnoser's
+rules table was also deliberately trimmed back to literal tokens only. Now ~9% of
+cases reach the LLM, which is the honest split.
+
+**2. The fake gateway's random ids broke reproducibility.**
+The local Razorpay fake minted ids with `random.random()`, so two runs of the
+same seed produced different `order_*` / `plink_*` ids and
+`result_to_dict` comparisons failed. Fix: derive the fake id from the
+idempotency key (`sha256(key)[:14]`) - which is also what a real idempotent
+create does, so the fake got *more* realistic, not less.
+
+**3. The money safety ceiling was set ~40x too low.**
+`MONEY.max_total_attempted_paise` was written as `100 * 5_000_00` (₹5,00,000)
+when it was meant to be ₹2 crore. The `SpendGovernor` then blocked every
+charge after the first fifty-odd cases, silently escalating two-thirds of the
+batch - headline recovery dropped 58% → 23% during the step 7 refactor. Caught
+by `git stash`-ing the change and re-running: the number moved when it
+shouldn't have. Fix: correct the constant, and scope the ceiling to *retries*
+(auto-charges) rather than customer-driven links.
+
+**4. A payload key named `kind` shadowed the audit record type.**
+`AuditSink._append(kind, payload)` did `{... "kind": kind, **payload}`, and the
+`case_summary` payload also had a `"kind"` (the case kind, "payment"/
+"subscription"). The spread overwrote the record type, so every summary line was
+`"kind": "payment"` and the hash still verified (it hashes whatever's there).
+Caught by a test asserting the record kinds. Fix: a `_RESERVED` set in
+`_append` so `seq` / `ts` / `kind` / `prev_hash` / `hash` always win over the
+payload.

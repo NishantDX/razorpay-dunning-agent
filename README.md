@@ -96,29 +96,39 @@ Payment Link, and if that also fails, **escalates to a human** with a full case 
 
 ## What broke, and how I got out
 
-_Dev journal kept in [docs/architecture.md](docs/architecture.md)._
+Four real bugs, written up in
+[docs/architecture.md](docs/architecture.md#what-broke-and-how-i-got-out): rules
+so good the LLM never fired, a fake gateway that broke reproducibility with
+random ids, a money ceiling set 40× too low that silently escalated two-thirds of
+a batch, and a payload key that shadowed the audit record type.
 
 ## Repo layout
 
 ```
 dunning/
-  config.py          central config: env, guardrail limits, stopping rules, vocabulary
-  generate.py        synthetic at-risk case generator (seeded)          [step 2]
-  feed.py            replays cases as an event stream                   [step 3]
-  diagnose.py        raw failure reason -> canonical root cause         [step 4]
-  policy.py          root cause + customer context -> intervention plan [step 5]
-  execute.py         carries out steps via Razorpay test APIs           [step 6]
-  guardrails.py      enforces hard caps + stopping rules                [step 7]
-  messaging.py       LLM writes the customer nudge                      [step 8]
-  audit.py           append-only JSONL audit log                       [step 9]
-  run_batch.py       runs the whole batch, writes the HTML report      [step 10]
-config/policy.yaml   the root-cause -> intervention table
-docs/architecture.md the architecture doc
+  config.py       env, guardrail + money limits, stopping rules, the shared vocab
+  redact.py       PII / secret masking - applied to everything logged or shown
+  generate.py     synthetic at-risk case generator (seeded); plants the showcases
+  feed.py         cases -> HMAC-signed, webhook-shaped events; verify on ingest
+  diagnose.py     raw failure -> one of 15 root causes (rules first, LLM tail)
+  llm.py          the only Gemini caller: classify_failure + complete, with a cache
+  policy.py       root cause + context -> a fixed, bounded plan
+  execute.py      walks a plan vs real Razorpay test APIs; virtual clock; oracle
+  guardrails.py   GuardrailLedger (per case) + SpendGovernor (per run)
+  messaging.py    per-channel / per-language customer nudge + safety validator
+  audit.py        append-only hash-chained log + signed manifest + verify()
+  baseline.py     naive strategies for the comparison
+  run_batch.py    the whole pipeline in one call
+  report.py       one self-contained reports/latest.html
+config/policy.yaml  the cause -> recovery-steps table
+docs/               architecture.md (component map, metrics, dev journal), pitch.md
 ```
 
 ## Status
 
-**Steps 1–10 of 13 complete.** The full pipeline runs end to end with `make run`.
+**All 13 build steps complete.** `make run` executes the whole pipeline and
+writes `reports/latest.html`; `make verify-audit` checks the audit chain.
+238 tests pass.
 
 - **Step 2** — `make generate`: ~300 seeded at-risk cases → `data/cases.jsonl`,
   each with ground-truth `root_cause`, a customer profile, a raw failure reason
@@ -174,5 +184,13 @@ docs/architecture.md the architecture doc
   run: **54.8% of at-risk value recovered** vs 22.8% (one blind retry) and 45.7%
   (three blind retries that break the ≥24h rule), 0 violations, 0 double charges.
 
-Next: step 11 (flesh out the baseline), 12 (deliberate-failure showcase),
-13 (dev journal + pitch).
+- **Step 11** — `dunning/baseline.py`: `naive_one_retry` and `blind_three`, both
+  sharing the executor's outcome oracle and per-case seed. The report shows how
+  many guardrail checks each would trip if held to the same rules.
+- **Step 12** — two deliberate failures, guaranteed in every batch and cited by
+  `case_id`: a subscription mandate cancelled mid-sequence (re-plan once, stop
+  retrying, escalate) and a customer paying out of band while a retry is pending
+  (a status check before the charge → no double charge).
+- **Step 13** — [docs/architecture.md](docs/architecture.md) (component map,
+  guardrail table, metrics definitions, dev journal) and
+  [docs/pitch.md](docs/pitch.md) (the 60-second version + a 3-minute demo script).
